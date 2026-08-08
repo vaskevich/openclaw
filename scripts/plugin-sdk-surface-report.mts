@@ -143,10 +143,10 @@ const defaultPublicDeprecatedExportsByEntrypointBudget = Object.freeze({
   "agent-runtime": 2,
   "channel-secret-runtime": 23,
   // +4: session-write lease no-op compatibility stubs through the 2026.10 train.
-  // +3: legacy AgentHarness, AgentHarnessAttemptParams, and EmbeddedRunAttemptParams
-  // remain deprecated while external harnesses migrate to the required-capability V2 contracts.
+  // +4: legacy AgentHarness, attempt, embedded-run, and side-question contracts remain
+  // deprecated while external harnesses migrate to required-capability V2 contracts.
   "agent-harness": 2,
-  "agent-harness-runtime": 11,
+  "agent-harness-runtime": 12,
   "agent-config-primitives": 2,
   "command-auth": 78,
   discord: 47,
@@ -256,8 +256,9 @@ export function readPluginSdkSurfaceBudgets(env: NodeJS.ProcessEnv = process.env
       // +1: worker desktop endpoint contract for desktop-capable worker leases.
       // +1: native command spec merger through the native-command-registry facade.
       // -2: remove unused WhatsApp-specific ack policy exports from channel-feedback.
-      // +5: required-capability V2 harness contracts through the focused and runtime barrels.
-      4852,
+      // +6: required-capability V2 harness contracts through the focused and runtime barrels,
+      // including the side-question compatibility split.
+      4853,
       env,
     ),
     publicFunctionExports: readPluginSdkSurfaceBudgetEnv(
@@ -326,8 +327,8 @@ export function readPluginSdkSurfaceBudgets(env: NodeJS.ProcessEnv = process.env
       // +1: shared ingress retention defaults projected through channel-message.
       // +1: shipped channel setup state-migration declaration during its migration window.
       // +4: session-write lease no-op compatibility stubs through the 2026.10 train.
-      // +5: source-compatible harness contracts retained during the V2 migration window.
-      1715,
+      // +6: source-compatible harness contracts retained during the V2 migration window.
+      1716,
       env,
     ),
     publicWildcardReexports: readPluginSdkSurfaceBudgetEnv(

@@ -761,6 +761,7 @@ async function probeTarget(params: {
   let isolatedAgentDir: string | null = null;
   let isolatedProfileId: string | undefined;
   let sessionTarget: Awaited<ReturnType<typeof prepareInternalSessionEffectsSession>> | undefined;
+  let preparedRunAdmission: ReturnType<typeof prepareSystemAgentRunAdmission> | undefined;
 
   const start = Date.now();
   const buildResult = (status: AuthProbeResult["status"], error?: string): AuthProbeResult => ({
@@ -819,13 +820,14 @@ async function probeTarget(params: {
       }
     }
     const { runEmbeddedAgent } = await loadEmbeddedRunnerModule();
+    preparedRunAdmission = prepareSystemAgentRunAdmission(
+      probeConfig,
+      runId,
+      agentId,
+      "models.auth-probe",
+    );
     await runEmbeddedAgent({
-      preparedRunAdmission: prepareSystemAgentRunAdmission(
-        probeConfig,
-        runId,
-        agentId,
-        "models.auth-probe",
-      ),
+      preparedRunAdmission,
       sessionId: sessionTarget.sessionId,
       sessionKey: sessionTarget.sessionKey,
       sessionTarget,
@@ -858,6 +860,7 @@ async function probeTarget(params: {
       redactAuthProbeError(described.message),
     );
   } finally {
+    preparedRunAdmission?.close();
     await removeInternalSessionEffectsSession(sessionTarget);
     if (isolatedAgentDir) {
       clearRuntimeAuthProfileStoreSnapshot(isolatedAgentDir);
