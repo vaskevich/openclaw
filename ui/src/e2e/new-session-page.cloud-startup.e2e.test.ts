@@ -13,6 +13,7 @@ import {
   pastePng,
   pollLocatorText,
   replaceGatewayClient,
+  waitForConfirmModal,
 } from "./new-session-page.test-support.ts";
 
 const suite = createNewSessionPageE2eSuite();
@@ -297,8 +298,10 @@ suite.define(() => {
       expect(await localSessionRow.locator(".session-row-badge--cloud").count()).toBe(0);
       expect(await cloudPlacementBadge.locator("circle").count()).toBe(1);
       expect(await cloudPlacementBadge.locator("rect").count()).toBe(0);
-      page.once("dialog", (dialog) => void dialog.accept());
       await stopWorker.click();
+      const confirmModal = await waitForConfirmModal(page);
+      await captureUiProof(page, "03-active-cloud-worker-stop-confirm.png");
+      await confirmModal.getByRole("button", { name: "Stop worker", exact: true }).click();
       const reclaim = await gateway.waitForRequest("sessions.reclaim");
       expect(reclaim.params).toEqual({ key: managedSessionKey, agentId: "cloud" });
     } finally {
