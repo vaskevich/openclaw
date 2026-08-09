@@ -7,6 +7,7 @@ import {
   PICKED,
   SESSION_LIST_DEFAULTS,
   WORKSPACE,
+  captureUiProof,
   controlUiSessionPath,
   createNewSessionPageE2eSuite,
   createdSessionListResult,
@@ -16,6 +17,16 @@ import {
 } from "./new-session-page.test-support.ts";
 
 const suite = createNewSessionPageE2eSuite();
+const gatewayEnvironment = {
+  id: "gateway",
+  type: "local",
+  status: "available",
+};
+const deviceEnvironment = (nodeId: string) => ({
+  id: `node:${nodeId}`,
+  type: "node",
+  status: "available",
+});
 
 suite.define(() => {
   it("drafts a session with a browsed folder and creates it on first message", async () => {
@@ -223,7 +234,7 @@ suite.define(() => {
           scope: "agent",
         },
         "environments.list": {
-          environments: [],
+          environments: [gatewayEnvironment],
           profiles: [{ id: "aws", providerId: "crabbox" }],
         },
         "fs.listDir": { path: WORKSPACE, home: "/home/peter", entries: [] },
@@ -260,11 +271,16 @@ suite.define(() => {
         .poll(async () => (await gateway.getRequests("worktrees.branches")).at(-1)?.params)
         .toEqual({ repoRoot: "/home", includeRepositoryStatus: true });
       await pollLocatorText(trigger.locator(".new-session-page__trigger-label")).toBe(
-        "home · Gateway · local",
+        "home · This gateway",
       );
 
       await trigger.click();
       expect(await place.getByRole("button", { name: "Worktree" }).count()).toBe(0);
+      await place
+        .locator(".new-session-page__menu-title")
+        .getByText("This gateway", { exact: true })
+        .waitFor();
+      await place.getByText("Cloud", { exact: true }).waitFor();
       const cloud = place.getByRole("button", { name: "Cloud · aws" });
       expect(await cloud.isDisabled()).toBe(true);
       expect(await cloud.getAttribute("title")).toBe("Cloud workers require a managed worktree");
@@ -293,7 +309,10 @@ suite.define(() => {
       workspaceGit: true,
       methodResponses: {
         "node.list": { nodes: [] },
-        "environments.list": { environments: [], profiles: [] },
+        "environments.list": {
+          environments: [gatewayEnvironment],
+          profiles: [],
+        },
       },
     });
 
@@ -305,7 +324,7 @@ suite.define(() => {
       await trigger.click();
       const place = page.locator("wa-popover.new-session-page__place-popover");
       expect(await place.getByText("Places", { exact: true }).count()).toBe(0);
-      await place.getByText("Runs on Gateway · local", { exact: true }).waitFor();
+      await place.getByText("Runs on This gateway", { exact: true }).waitFor();
     } finally {
       await context.close();
     }
@@ -334,7 +353,10 @@ suite.define(() => {
             },
           ],
         },
-        "environments.list": { environments: [], profiles: [] },
+        "environments.list": {
+          environments: [gatewayEnvironment, deviceEnvironment("macbook")],
+          profiles: [],
+        },
       },
     });
 
@@ -364,6 +386,94 @@ suite.define(() => {
       await pollLocatorText(trigger.locator(".new-session-page__trigger-label")).toBe("openclaw");
       await trigger.click();
       await place.getByText("Runs on Gateway · Peters-Mac-Studio", { exact: true }).waitFor();
+    } finally {
+      await context.close();
+    }
+  });
+
+  it("shows live devices when the initial environment catalog is unavailable", async () => {
+    const context = await suite.browser.newContext({ locale: "en-US", serviceWorkers: "block" });
+    const page = await context.newPage();
+    const gateway = await installMockGateway(page, {
+      methodResponses: {
+        "node.list": {
+          nodes: [
+            {
+              nodeId: "fallback-device",
+              displayName: "Fallback device",
+              connected: true,
+              commands: ["system.run"],
+            },
+          ],
+        },
+        "environments.list": {
+          __mockError: {
+            code: "UNAVAILABLE",
+            message: "environment catalog unavailable",
+          },
+        },
+      },
+    });
+
+    try {
+      await page.goto(`${suite.server.baseUrl}new`);
+      await gateway.waitForRequest("node.list");
+      await gateway.waitForRequest("environments.list");
+      await page.locator("#new-session-place-trigger").click();
+      const place = page.locator("wa-popover.new-session-page__place-popover");
+      await place.getByText("Devices", { exact: true }).waitFor();
+      await place.getByRole("button", { name: "Fallback device" }).waitFor();
+      await captureUiProof(page, "04-catalog-unavailable-device-fallback.png");
+    } finally {
+      await context.close();
+    }
+  });
+
+  it("keeps the last environment catalog across a same-Gateway client refresh failure", async () => {
+    const context = await suite.browser.newContext({ locale: "en-US", serviceWorkers: "block" });
+    const page = await context.newPage();
+    const gateway = await installMockGateway(page, {
+      methodResponses: {
+        "node.list": {
+          nodes: [
+            {
+              nodeId: "stable-device",
+              displayName: "Stable device",
+              connected: true,
+              commands: ["system.run"],
+            },
+          ],
+        },
+        "environments.list": {
+          environments: [deviceEnvironment("stable-device")],
+          profiles: [],
+        },
+      },
+    });
+
+    try {
+      await page.goto(`${suite.server.baseUrl}new`);
+      await gateway.waitForRequest("environments.list");
+      const trigger = page.locator("#new-session-place-trigger");
+      const place = page.locator("wa-popover.new-session-page__place-popover");
+      await trigger.click();
+      await place.getByRole("button", { name: "Stable device" }).waitFor();
+      await page.keyboard.press("Escape");
+
+      await gateway.setMethodResponse("environments.list", {
+        __mockError: {
+          code: "UNAVAILABLE",
+          message: "environment refresh unavailable",
+        },
+      });
+      const environmentRequests = (await gateway.getRequests("environments.list")).length;
+      await replaceGatewayClient(page);
+      await expect
+        .poll(async () => (await gateway.getRequests("environments.list")).length)
+        .toBeGreaterThan(environmentRequests);
+
+      await trigger.click();
+      await place.getByRole("button", { name: "Stable device" }).waitFor();
     } finally {
       await context.close();
     }
@@ -408,7 +518,15 @@ suite.define(() => {
             },
           ],
         },
-        "environments.list": { environments: [], profiles: [] },
+        "environments.list": {
+          environments: [
+            gatewayEnvironment,
+            { id: "node:11111111aaaaaaaa", type: "node", status: "available" },
+            deviceEnvironment("22222222bbbbbbbb"),
+            deviceEnvironment("33333333cccccccc"),
+          ],
+          profiles: [],
+        },
       },
     });
 
@@ -417,6 +535,12 @@ suite.define(() => {
       await gateway.waitForRequest("node.list");
       const trigger = page.locator("#new-session-place-trigger");
       await trigger.click();
+      const place = page.locator("wa-popover.new-session-page__place-popover");
+      await place
+        .locator(".new-session-page__menu-title")
+        .getByText("This gateway", { exact: true })
+        .waitFor();
+      await place.getByText("Devices", { exact: true }).waitFor();
       const first = page.locator('[data-value="node:11111111aaaaaaaa"]');
       const second = page.locator('[data-value="node:22222222bbbbbbbb"]');
       const phone = page.locator('[data-value="node:33333333cccccccc"]');
@@ -428,6 +552,7 @@ suite.define(() => {
       expect(await phone.locator(".session-menu__icon svg").count()).toBe(1);
       expect(await first.getAttribute("title")).toBe("macOS · Mac14,12 · 192.168.1.11");
       expect(await second.getAttribute("title")).toContain("192.168.1.12");
+      await captureUiProof(page, "03-legacy-device-picker.png");
       await second.click();
       await pollLocatorText(trigger.locator(".new-session-page__trigger-label")).toBe(
         "Agent workspace · Mac Studio",
@@ -439,7 +564,7 @@ suite.define(() => {
     }
   });
 
-  it("disambiguates duplicate recent basenames and applies the selected path", async () => {
+  it("groups duplicate recent basenames by the most recent path", async () => {
     const context = await suite.browser.newContext({ locale: "en-US", serviceWorkers: "block" });
     const page = await context.newPage();
     const gateway = await installMockGateway(page, {
@@ -469,14 +594,14 @@ suite.define(() => {
       await trigger.click();
       const first = page.locator('[data-value="recent::/a/openclaw"]');
       const second = page.locator('[data-value="recent::/b/openclaw"]');
-      await pollLocatorText(first.locator(".session-menu__sub")).toBe("a");
-      await pollLocatorText(second.locator(".session-menu__sub")).toBe("b");
-      await second.click();
+      await first.waitFor();
+      expect(await second.count()).toBe(0);
+      await first.click();
       await page.locator(".new-session-page__message").fill("continue in work checkout");
       await page.getByRole("button", { name: "Start session" }).click();
       const create = await gateway.waitForRequest("sessions.create");
       expect(create.params).toMatchObject({
-        cwd: "/b/openclaw",
+        cwd: "/a/openclaw",
         message: "continue in work checkout",
       });
     } finally {
@@ -500,6 +625,10 @@ suite.define(() => {
               commands: ["system.run", "fs.listDir"],
             },
           ],
+        },
+        "environments.list": {
+          environments: [gatewayEnvironment, deviceEnvironment("macbook")],
+          profiles: [],
         },
         "sessions.list": {
           count: 2,
@@ -645,6 +774,15 @@ suite.define(() => {
             },
           ],
         },
+        "environments.list": {
+          environments: [
+            gatewayEnvironment,
+            deviceEnvironment("macbook"),
+            deviceEnvironment("old-node"),
+            deviceEnvironment("offline-node"),
+          ],
+          profiles: [],
+        },
         "fs.listDir": {
           cases: [
             {
@@ -688,8 +826,13 @@ suite.define(() => {
       const placeLabel = placeTrigger.locator(".new-session-page__trigger-label");
       const browserEntries = page.locator(".new-session-page__browser-list");
 
-      // Pick the node from Places.
+      // Pick the node from Devices.
       await placeTrigger.click();
+      await placeSelect
+        .locator(".new-session-page__menu-title")
+        .getByText("This gateway", { exact: true })
+        .waitFor();
+      await placeSelect.getByText("Devices", { exact: true }).waitFor();
       await placeSelect.getByRole("button", { name: "MacBook" }).click();
       await pollLocatorText(placeLabel).toBe("Agent workspace · MacBook");
       // Node sessions cannot use managed worktrees, so the menu drops the item.
@@ -713,11 +856,14 @@ suite.define(() => {
           placeSelect.evaluate((element) => (element as HTMLElement & { open: boolean }).open),
         )
         .toBe(true);
-      await placeSelect.getByText("Places", { exact: true }).waitFor();
+      await placeSelect
+        .locator(".new-session-page__menu-title")
+        .getByText("This gateway", { exact: true })
+        .waitFor();
 
-      // Destination selection stays in Places; browsing is fixed to the current target.
-      await placeSelect.getByRole("button", { name: "Gateway · local" }).click();
-      await pollLocatorText(placeLabel).toBe("openclaw · Gateway · local");
+      // Destination selection stays grouped by place; browsing is fixed to the current target.
+      await placeSelect.getByRole("button", { name: "This gateway" }).click();
+      await pollLocatorText(placeLabel).toBe("openclaw · This gateway");
       await placeTrigger.click();
       expect(await placeSelect.getByRole("button", { name: "Offline node" }).count()).toBe(0);
       await placeSelect.getByRole("button", { name: "MacBook" }).click();
