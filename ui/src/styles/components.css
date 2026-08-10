@@ -3287,8 +3287,6 @@ td.data-table-key-col {
    replaced; this is the zone that should read as settled rather than incidental. */
 .secret-reveal__body {
   margin-top: 16px;
-  display: grid;
-  gap: 8px;
   color: var(--text);
   font-size: 13px;
   line-height: 1.6;
@@ -3300,6 +3298,15 @@ td.data-table-key-col {
 
 .secret-reveal__callout {
   margin-top: 12px;
+  text-wrap: balance;
+}
+
+/* .btn's resting border (--border) sits within ~4/255 of --card in dark
+   (#1e2028 on #161920), so a neutral button reads as unpainted on this surface.
+   --border-strong is the token that separates from a card in both themes; the
+   inherited .btn:hover still supplies the hover surface. */
+.secret-reveal__dismiss {
+  border-color: var(--border-strong);
 }
 
 /* Trailing rationale: readable, but never competing with the outcome above it. */

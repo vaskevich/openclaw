@@ -585,13 +585,11 @@ export const en: TranslationMap = {
         "Copy this token now and store it securely. It is shown once and cannot be recovered.",
       rotateAcknowledge: "I saved this token",
       rotateDismissHint: "This dialog stays open until you confirm the token is saved.",
-      rotateWithheldTitle: "Token rotated",
-      rotateWithheldOutcome: "{device} has a new {role} token and was signed out.",
+      rotateWithheldTitle: "Token rotated · {device}",
       rotateWithheldNext:
-        "It will reconnect and pick up the new token automatically — nothing else to do.",
-      rotateWithheldException:
-        "If this device can only sign in with its device token, you will need to pair it again.",
-      rotateWithheldNote: "For security, a new token is only revealed on the device itself.",
+        "It will reconnect with the new token automatically — nothing else to do.",
+      rotateWithheldException: "If it can only sign in with its device token, pair it again.",
+      rotateWithheldNote: "For security, the new token is only revealed on the device itself.",
       gateway: "gateway",
       unpaired: "unpaired",
       unknownClient: "unknown client",

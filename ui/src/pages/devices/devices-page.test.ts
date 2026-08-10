@@ -483,12 +483,11 @@ describe("DevicesPage gateway lifecycle", () => {
     const pending = page.reportRotationOutcome({ id: "device-2", name: "Mac Studio" }, "operator");
     const { dialog } = await waitForRenderedModalDialog(document.body);
 
-    expect(dialog.getAttribute("aria-label")).toBe(t("devices.inventory.rotateWithheldTitle"));
-    // Leads with the outcome and names the device the operator clicked, then tells them
-    // the common case needs nothing from them, then the one case that does.
-    expect(document.body.textContent).toContain(
-      t("devices.inventory.rotateWithheldOutcome", { device: "Mac Studio", role: "operator" }),
+    // The title carries the announcement and names the device the operator clicked.
+    expect(dialog.getAttribute("aria-label")).toBe(
+      t("devices.inventory.rotateWithheldTitle", { device: "Mac Studio" }),
     );
+    expect(document.body.textContent).toContain("Mac Studio");
     expect(document.body.textContent).toContain(t("devices.inventory.rotateWithheldNext"));
     // The one actionable branch is a callout, not a fourth sentence in the calm block.
     expect(document.body.querySelector(".secret-reveal__callout")?.textContent).toContain(
@@ -497,7 +496,7 @@ describe("DevicesPage gateway lifecycle", () => {
     expect(document.body.querySelector(".secret-reveal__status")).not.toBeNull();
     // Closing a report of work already done commits nothing, so it is not the accent button.
     const close = findDialogButton(t("common.close"));
-    expect(close.className).toBe("btn");
+    expect(close.className).toBe("btn secret-reveal__dismiss");
     expect(document.body.querySelector(".secret-reveal__note")?.textContent).toContain(
       t("devices.inventory.rotateWithheldNote"),
     );

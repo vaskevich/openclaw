@@ -9,9 +9,7 @@ import "./modal-dialog.ts";
 
 type SecretRevealDialogOptions = {
   title: string;
-  /** One paragraph per element, so an outcome can lead and its exception stay separate
-   *  instead of collapsing into a wall of clauses. */
-  message: string | string[];
+  message: string;
   /** Omitted when the operation issued no secret to this operator; the dialog then
    *  reports the outcome only, and dismissal gestures behave normally. */
   secret?: string;
@@ -58,17 +56,17 @@ export function showSecretRevealDialog(options: SecretRevealDialogOptions): Prom
       dismissRefused = true;
       paint();
     };
-    const paragraphs = Array.isArray(options.message) ? options.message : [options.message];
     // Sibling convention (confirm-dialog): the accent button is the action that commits
     // something. Acknowledging a secret is that gate; closing a report of work already
-    // done is not, so it stays the neutral button.
-    const acknowledgeClass = options.secret ? "btn primary" : "btn";
+    // done is not, so it stays neutral -- with a raised border, because .btn's resting
+    // border sits within ~4/255 of --card in dark and vanishes on this surface.
+    const acknowledgeClass = options.secret ? "btn primary" : "btn secret-reveal__dismiss";
     const paint = () => {
       render(
         html`
           <openclaw-modal-dialog
             label=${options.title}
-            description=${paragraphs.join(" ")}
+            description=${options.message}
             @modal-cancel=${handleCancel}
           >
             <div class="exec-approval-card">
@@ -80,9 +78,7 @@ export function showSecretRevealDialog(options: SecretRevealDialogOptions): Prom
                   : nothing}
                 <div class="exec-approval-title">${options.title}</div>
               </div>
-              <div class="secret-reveal__body">
-                ${paragraphs.map((paragraph) => html`<p>${paragraph}</p>`)}
-              </div>
+              <div class="secret-reveal__body"><p>${options.message}</p></div>
               ${options.callout
                 ? html`<div class="callout info secret-reveal__callout">${options.callout}</div>`
                 : nothing}

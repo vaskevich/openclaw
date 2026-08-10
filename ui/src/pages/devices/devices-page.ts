@@ -446,15 +446,12 @@ class DevicesPage extends OpenClawLightDomElement {
           dismissHint: t("devices.inventory.rotateDismissHint"),
         })
       : showSecretRevealDialog({
-          title: t("devices.inventory.rotateWithheldTitle"),
+          // The title carries the announcement and the device, so the body is only the
+          // reassurance. Naming the transient disconnect here would raise an alarm the
+          // very next line has to walk back.
+          title: t("devices.inventory.rotateWithheldTitle", { device: device.name }),
           status: "success",
-          // Outcome, then what happens without the operator. The one conditional branch
-          // is a callout so it cannot be skimmed past, and the protocol reason is a
-          // footnote rather than a fourth sentence competing with the reassurance.
-          message: [
-            t("devices.inventory.rotateWithheldOutcome", { device: device.name, role }),
-            t("devices.inventory.rotateWithheldNext"),
-          ],
+          message: t("devices.inventory.rotateWithheldNext"),
           callout: t("devices.inventory.rotateWithheldException"),
           acknowledgeLabel: t("common.close"),
           note: t("devices.inventory.rotateWithheldNote"),
