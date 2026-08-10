@@ -181,7 +181,7 @@ async function runCommandWithOutputEncoding(
     cancelController,
     baseEnv,
     env,
-    killProcessTree,
+    processTree: killProcessTree ? { mode: "graceful" } : undefined,
     isChildExited: () => childExited,
     isCommandSettled: () => commandSettled,
   });
