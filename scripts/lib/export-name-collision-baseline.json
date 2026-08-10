@@ -45,14 +45,6 @@
     "sdk": true
   },
   {
-    "name": "buildApprovalPresentation",
-    "files": [
-      "src/infra/approval-presentation.ts",
-      "src/infra/exec-approval-reply.ts"
-    ],
-    "sdk": true
-  },
-  {
     "name": "buildBundleMcpToolsFromCatalog",
     "files": [
       "src/agents/agent-bundle-mcp-materialize.ts",
@@ -267,13 +259,6 @@
     "files": [
       "src/agents/sessions/session-manager-id.ts",
       "src/agents/tools/transcripts-tool-runtime.ts"
-    ]
-  },
-  {
-    "name": "createSessionSlug",
-    "files": [
-      "src/agents/bash-process-registry.ts",
-      "src/agents/session-slug.ts"
     ]
   },
   {
@@ -1321,14 +1306,6 @@
     "sdk": true
   },
   {
-    "name": "resolveHomeDir",
-    "files": [
-      "src/daemon/paths.ts",
-      "src/utils.ts"
-    ],
-    "sdk": true
-  },
-  {
     "name": "resolveMarketplaceInstallShortcut",
     "files": [
       "src/cli/plugins-cli-test-helpers.ts",
@@ -1546,14 +1523,6 @@
     "files": [
       "src/infra/crypto-digest.ts",
       "src/logging/redact-identifier.ts"
-    ],
-    "sdk": true
-  },
-  {
-    "name": "sleep",
-    "files": [
-      "src/tui/tui-pty-test-support.ts",
-      "src/utils/sleep.ts"
     ],
     "sdk": true
   },
