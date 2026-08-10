@@ -21,12 +21,13 @@ import { WorkboardStore, type WorkboardDispatchResult } from "./store.js";
 import {
   assertCanonicalWorkboardRootAccess,
   assertWorkboardWorkspaceSourceAccess,
+  normalizeWorkboardAgentId,
+  resolveWorkboardDispatchAgentId,
   WORKBOARD_REQUIRED_WORKER_TOOLS,
   type WorkboardWorkspaceAccess,
 } from "./workspace-access.js";
 
 const DEFAULT_DISPATCH_MAX_STARTS = 3;
-const DEFAULT_DISPATCH_OWNER = "workboard-dispatcher";
 
 export type WorkboardSubagentRuntime = Pick<PluginRuntime["subagent"], "run">;
 export type WorkboardWorktreeRuntime = PluginRuntime["worktrees"];
@@ -40,6 +41,7 @@ type WorkboardDispatchStartOptions = {
   now?: number;
   materializeWorktree?: boolean;
   resolveAgentWorkspace?: (agentId?: string) => string;
+  resolveDefaultAgentId?: () => string;
   resolveAgentWorkspaceRuntime?: ResolveAgentWorkspaceRuntime;
   workspaceAccess?: WorkboardWorkspaceAccess;
 };
@@ -99,7 +101,8 @@ function buildSessionKey(card: WorkboardCard): string {
   const boardId = sanitizeSessionSegment(cardBoardId(card), "default");
   const cardId = sanitizeSessionSegment(card.id, "card");
   const suffix = `subagent:workboard-${boardId}-${cardId}`;
-  return card.agentId ? `agent:${sanitizeSessionSegment(card.agentId, "agent")}:${suffix}` : suffix;
+  const agentId = normalizeWorkboardAgentId(card.agentId);
+  return agentId ? `agent:${sanitizeSessionSegment(agentId, "agent")}:${suffix}` : suffix;
 }
 
 function buildExecution(params: {
@@ -237,12 +240,16 @@ function sortReadyCards(a: WorkboardCard, b: WorkboardCard): number {
   );
 }
 
-function resolveDispatchOwner(card: WorkboardCard, now: number, ownerOverride?: string): string {
+function resolveDispatchOwner(
+  card: WorkboardCard,
+  now: number,
+  resolveAgentId: (card: WorkboardCard) => string,
+  ownerOverride?: string,
+): string {
   return (
     ownerOverride ||
     (cardHasActiveClaim(card, now) ? card.metadata?.claim?.ownerId : undefined) ||
-    card.agentId ||
-    DEFAULT_DISPATCH_OWNER
+    resolveAgentId(card)
   );
 }
 
@@ -252,6 +259,7 @@ function selectStartableCards(
   candidates: WorkboardCard[],
   ownerOverride: string | undefined,
   now: number,
+  resolveAgentId: (card: WorkboardCard) => string,
 ): WorkboardCard[] {
   if (limit <= 0) {
     return [];
@@ -271,7 +279,7 @@ function selectStartableCards(
     }
     // A grace-protected running claim still occupies its actual worker, even
     // after the lease expires and the card's assigned agent differs.
-    const owner = claim?.ownerId ?? resolveDispatchOwner(card, now);
+    const owner = claim?.ownerId ?? resolveDispatchOwner(card, now, resolveAgentId);
     runningByOwner.set(owner, (runningByOwner.get(owner) ?? 0) + 1);
   }
   const selected: WorkboardCard[] = [];
@@ -283,7 +291,7 @@ function selectStartableCards(
         entry.status === "ready" && !cardHasActiveClaim(entry, now) && !cardIsArchived(entry),
     )
     .toSorted(sortReadyCards)) {
-    const owner = resolveDispatchOwner(card, now, ownerOverride);
+    const owner = resolveDispatchOwner(card, now, resolveAgentId, ownerOverride);
     if ((runningByOwner.get(owner) ?? 0) > 0) {
       continue;
     }
@@ -336,14 +344,31 @@ async function runWorkboardDispatch(
   const cards = await params.store.list();
   const candidates = await params.store.list({ boardId });
   const ownerOverride = params.options?.ownerId?.trim() || undefined;
+  let defaultAgentId: string | undefined;
+  const resolveAgentId = (card: WorkboardCard): string =>
+    resolveWorkboardDispatchAgentId(card.agentId, () => {
+      defaultAgentId ??= params.options?.resolveDefaultAgentId?.().trim();
+      if (!defaultAgentId) {
+        throw new Error("Workboard dispatch requires a configured default agent.");
+      }
+      return defaultAgentId;
+    });
   const startedOwners = new Set<string>();
   // Allow one fallback per worker slot without draining the queue during an outage.
   const maxAttempts = maxStarts * 2;
   let acceptedStarts = 0;
   let attemptedStarts = 0;
 
-  for (const card of selectStartableCards(cards, maxStarts, candidates, ownerOverride, now)) {
-    const ownerId = resolveDispatchOwner(card, now, ownerOverride);
+  for (const card of selectStartableCards(
+    cards,
+    maxStarts,
+    candidates,
+    ownerOverride,
+    now,
+    resolveAgentId,
+  )) {
+    const dispatchAgentId = resolveAgentId(card);
+    const ownerId = resolveDispatchOwner(card, now, resolveAgentId, ownerOverride);
     if (acceptedStarts >= maxStarts || attemptedStarts >= maxAttempts) {
       break;
     }
@@ -389,7 +414,7 @@ async function runWorkboardDispatch(
           await assertCanonicalWorkboardRootAccess(implicitWorkspaceCwd, workspaceAccess);
           await assertRestrictedWorkboardTarget({
             root: implicitWorkspaceCwd,
-            agentId: card.agentId,
+            agentId: dispatchAgentId,
             sessionKey,
             modelProvider: params.options?.provider,
             modelId: params.options?.model,
@@ -422,7 +447,7 @@ async function runWorkboardDispatch(
           await assertCanonicalWorkboardRootAccess(canonicalSourcePath, workspaceAccess);
           await assertRestrictedWorkboardTarget({
             root: canonicalSourcePath,
-            agentId: card.agentId,
+            agentId: dispatchAgentId,
             sessionKey,
             modelProvider: params.options?.provider,
             modelId: params.options?.model,
@@ -452,6 +477,7 @@ async function runWorkboardDispatch(
             workspaceAccess: card.metadata?.automation?.workspaceAccess,
           },
           adoptWorkspaceAccess: persistWorkspaceAccess ? workspaceAccess : undefined,
+          adoptAgentId: dispatchAgentId,
         },
       );
       claimValue = claimed.token;
@@ -470,7 +496,7 @@ async function runWorkboardDispatch(
         await assertRestrictedWorkboardTarget({
           root: runCwd,
           // Claim may populate agentId; keep the sessionKey target identity.
-          agentId: card.agentId,
+          agentId: dispatchAgentId,
           sessionKey,
           modelProvider: params.options?.provider,
           modelId: params.options?.model,

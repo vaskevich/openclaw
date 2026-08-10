@@ -374,7 +374,12 @@ describe("workboard gateway methods", () => {
     registerWorkboardGatewayMethods({ api, store });
 
     const respond = vi.fn();
-    await methods.get("workboard.cards.dispatch")?.handler({ respond } as never);
+    await methods.get("workboard.cards.dispatch")?.handler({
+      respond,
+      context: {
+        getRuntimeConfig: () => ({ agents: { list: [{ id: "main", default: true }] } }),
+      },
+    } as never);
 
     expect(respond.mock.calls[0]?.[0]).toBe(true);
     expect(respond.mock.calls[0]?.[1]).toMatchObject({
@@ -385,6 +390,10 @@ describe("workboard gateway methods", () => {
         sessionKey: `subagent:workboard-default-${card.id}`,
       }),
     );
+    await expect(store.get(card.id)).resolves.toMatchObject({
+      agentId: "main",
+      metadata: { claim: { ownerId: "main" } },
+    });
   });
 
   it("threads maxStarts while the legacy method keeps its default cap", async () => {

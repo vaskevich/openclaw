@@ -4,6 +4,7 @@ import {
   type WorkboardStatus,
 } from "@openclaw/workboard-contract";
 // Workboard plugin module implements command behavior.
+import { resolveDefaultAgentId } from "openclaw/plugin-sdk/agent-runtime";
 import type { OpenClawPluginApi } from "../api.js";
 import { resolveWorkboardCardByIdOrPrefix } from "./card-lookup.js";
 import {
@@ -106,6 +107,7 @@ async function handleWorkboardCommand(params: {
   senderIsOwner?: boolean;
   gatewayClientScopes?: readonly string[];
   resolveAgentWorkspace?: (agentId?: string) => string;
+  resolveDefaultAgentId?: () => string;
   resolveAgentWorkspaceRuntime?: (
     agentId: string | undefined,
     sessionKey: string,
@@ -195,6 +197,7 @@ async function handleWorkboardCommand(params: {
       worktrees: params.api.runtime.worktrees,
       options: {
         materializeWorktree: true,
+        resolveDefaultAgentId: params.resolveDefaultAgentId,
         resolveAgentWorkspace: params.resolveAgentWorkspace,
         resolveAgentWorkspaceRuntime: params.resolveAgentWorkspaceRuntime,
         workspaceAccess,
@@ -230,6 +233,7 @@ export function registerWorkboardCommand(params: {
         senderIsOwner: ctx.senderIsOwner,
         gatewayClientScopes: ctx.gatewayClientScopes,
         resolveAgentWorkspace: (agentId) => resolveWorkboardAgentWorkspace(ctx.config, agentId),
+        resolveDefaultAgentId: () => resolveDefaultAgentId(ctx.config),
         resolveAgentWorkspaceRuntime: (agentId, sessionKey, workspaceDir, modelProvider, modelId) =>
           resolveAgentWorkboardWorkspaceRuntime({
             config: ctx.config,

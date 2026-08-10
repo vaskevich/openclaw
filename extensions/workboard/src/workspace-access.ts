@@ -11,6 +11,7 @@ import type {
   OpenClawPluginApi,
   OpenClawPluginToolContext,
 } from "openclaw/plugin-sdk/plugin-entry";
+import { normalizeAgentId } from "openclaw/plugin-sdk/routing";
 import {
   canonicalPathFromExistingAncestor,
   isPathInside,
@@ -68,8 +69,28 @@ export const WORKBOARD_REQUIRED_WORKER_TOOLS = [
   "workboard_block",
 ] as const;
 
+export function normalizeWorkboardAgentId(agentId: string | undefined): string | undefined {
+  const explicit = agentId?.trim();
+  return explicit ? normalizeAgentId(explicit) : undefined;
+}
+
+export function resolveWorkboardDispatchAgentId(
+  agentId: string | undefined,
+  resolveDefault: () => string,
+): string {
+  const resolved =
+    normalizeWorkboardAgentId(agentId) ?? normalizeWorkboardAgentId(resolveDefault());
+  if (!resolved) {
+    throw new Error("Workboard dispatch could not resolve an owning agent.");
+  }
+  return resolved;
+}
+
 export function resolveWorkboardAgentWorkspace(config: WorkboardConfig, agentId?: string): string {
-  return resolveAgentWorkspaceDir(config, agentId ?? resolveDefaultAgentId(config));
+  return resolveAgentWorkspaceDir(
+    config,
+    resolveWorkboardDispatchAgentId(agentId, () => resolveDefaultAgentId(config)),
+  );
 }
 
 export function resolveConfiguredWorkboardWorkspaceAccess(params: {
@@ -103,7 +124,9 @@ export async function resolveAgentWorkboardWorkspaceRuntime(params: {
   modelId?: string;
   prepareSandboxWorkspaceAuthority: PrepareSandboxWorkspaceAuthority;
 }): Promise<WorkboardTargetWorkspaceRuntime> {
-  const agentId = params.agentId ?? resolveDefaultAgentId(params.config);
+  const agentId = resolveWorkboardDispatchAgentId(params.agentId, () =>
+    resolveDefaultAgentId(params.config),
+  );
   const sandboxRuntime = await params.prepareSandboxWorkspaceAuthority({
     config: params.config,
     agentId,
@@ -142,7 +165,9 @@ export function resolveCommandWorkboardWorkspaceAccess(params: {
       unrestricted: params.gatewayClientScopes.includes("operator.admin"),
     });
   }
-  const agentId = params.agentId ?? resolveDefaultAgentId(params.config);
+  const agentId = resolveWorkboardDispatchAgentId(params.agentId, () =>
+    resolveDefaultAgentId(params.config),
+  );
   const sandboxRuntime =
     params.sessionKey && params.resolveSandboxWorkspaceAuthority
       ? params.resolveSandboxWorkspaceAuthority({

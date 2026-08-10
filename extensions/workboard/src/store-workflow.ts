@@ -134,9 +134,20 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
       if (activeClaim) {
         throw new Error(`card already claimed by ${activeClaim.ownerId}.`);
       }
-      const claimable =
+      const adoptedWorkspaceAccess =
         options.adoptWorkspaceAccess && !guarded.metadata?.automation?.workspaceAccess
-          ? await this.updateCard(id, { workspaceAccess: options.adoptWorkspaceAccess })
+          ? options.adoptWorkspaceAccess
+          : undefined;
+      const adoptedAgentId =
+        options.adoptAgentId && guarded.agentId !== options.adoptAgentId
+          ? options.adoptAgentId
+          : undefined;
+      const claimable =
+        adoptedWorkspaceAccess || adoptedAgentId
+          ? await this.updateCard(id, {
+              ...(adoptedWorkspaceAccess ? { workspaceAccess: adoptedWorkspaceAccess } : {}),
+              ...(adoptedAgentId ? { agentId: adoptedAgentId } : {}),
+            })
           : guarded;
       const metadata = clearDiagnostics(claimable.metadata, ["stranded_ready"]);
       const card = await this.updateCard(id, {
@@ -150,7 +161,6 @@ export class WorkboardWorkflowStore extends WorkboardPromoteStore {
           card.status === "backlog" || card.status === "todo" || card.status === "ready"
             ? "running"
             : card.status,
-        agentId: card.agentId ?? ownerId,
       });
       return { card: next, token };
     });

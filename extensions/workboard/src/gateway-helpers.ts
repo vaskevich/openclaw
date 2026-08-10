@@ -1,5 +1,6 @@
 import { WORKBOARD_STATUSES, type WorkboardCard } from "@openclaw/workboard-contract";
 // Workboard plugin module implements shared gateway request helpers.
+import { resolveDefaultAgentId } from "openclaw/plugin-sdk/agent-runtime";
 import { formatErrorMessage } from "openclaw/plugin-sdk/error-runtime";
 import { parseStrictPositiveInteger } from "openclaw/plugin-sdk/number-runtime";
 import type { OpenClawPluginApi } from "../api.js";
@@ -118,6 +119,7 @@ export function createWorkboardDispatchHandler(params: {
           boardId: typeof boardId === "string" ? boardId : undefined,
           ...(maxStarts !== undefined ? { maxStarts } : {}),
           materializeWorktree: true,
+          resolveDefaultAgentId: () => resolveDefaultAgentId(context.getRuntimeConfig()),
           resolveAgentWorkspace: (agentId) =>
             resolveWorkboardAgentWorkspace(context.getRuntimeConfig(), agentId),
           resolveAgentWorkspaceRuntime: (

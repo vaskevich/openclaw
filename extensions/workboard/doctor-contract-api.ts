@@ -289,4 +289,34 @@ export const stateMigrations: PluginDoctorStateMigration[] = [
       }
     },
   },
+  {
+    id: "workboard-agent-identity-normalization",
+    label: "Workboard agent identity normalization",
+    doctorOnly: true,
+    async detectLegacyState(params) {
+      const { countAmbiguousWorkboardAgentIds } = await import("./src/sqlite-doctor-migrations.js");
+      const count = countAmbiguousWorkboardAgentIds(migrationEnv(params));
+      return count === 0
+        ? null
+        : {
+            preview: [
+              `- Workboard: ${count} ambiguous agent ${count === 1 ? "identity" : "identities"} → unassigned`,
+            ],
+          };
+    },
+    async migrateLegacyState(params) {
+      const { normalizeAmbiguousWorkboardAgentIds } =
+        await import("./src/sqlite-doctor-migrations.js");
+      const count = normalizeAmbiguousWorkboardAgentIds(migrationEnv(params));
+      return {
+        changes:
+          count === 0
+            ? []
+            : [
+                `Normalized ${count} Workboard agent ${count === 1 ? "identity" : "identities"} in SQLite.`,
+              ],
+        warnings: [],
+      };
+    },
+  },
 ];

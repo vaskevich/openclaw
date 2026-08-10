@@ -26,6 +26,61 @@ function createDoctorContext(env: NodeJS.ProcessEnv): PluginDoctorStateMigration
 }
 
 describe("workboard doctor contract", () => {
+  it("normalizes poisoned dispatcher and blank agent identities", async () => {
+    const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-doctor-"));
+    const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };
+    try {
+      const sqlite = createWorkboardSqliteStores({ env });
+      for (const [id, agentId] of [
+        ["sentinel", "workboard-dispatcher"],
+        ["blank", "   "],
+        ["assigned", "Researcher"],
+      ] as const) {
+        await sqlite.cards.register(id, {
+          version: 1,
+          card: {
+            id,
+            title: id,
+            status: "blocked",
+            priority: "normal",
+            labels: [],
+            position: 1000,
+            createdAt: 1,
+            updatedAt: 2,
+            agentId,
+          },
+        });
+      }
+      sqlite.close();
+
+      const migration = expectDefined(stateMigrations[1], "workboard agent identity migration");
+      expect(migration.doctorOnly).toBe(true);
+      const params = {
+        config: {},
+        env,
+        stateDir,
+        oauthDir: path.join(stateDir, "oauth"),
+        context: createDoctorContext(env),
+      };
+      await expect(migration.detectLegacyState(params)).resolves.toMatchObject({
+        preview: [expect.stringContaining("2 ambiguous agent identities")],
+      });
+      await expect(migration.migrateLegacyState(params)).resolves.toEqual({
+        changes: ["Normalized 2 Workboard agent identities in SQLite."],
+        warnings: [],
+      });
+
+      const reopened = createWorkboardSqliteStores({ env });
+      expect((await reopened.cards.lookup("sentinel"))?.card.agentId).toBeUndefined();
+      expect((await reopened.cards.lookup("blank"))?.card.agentId).toBeUndefined();
+      expect((await reopened.cards.lookup("assigned"))?.card.agentId).toBe("Researcher");
+      reopened.close();
+      await expect(migration.detectLegacyState(params)).resolves.toBeNull();
+    } finally {
+      fs.rmSync(stateDir, { recursive: true, force: true });
+    }
+  });
+
   it("migrates shipped .28 plugin-state workboard data into sqlite", async () => {
     const stateDir = fs.mkdtempSync(path.join(os.tmpdir(), "openclaw-workboard-doctor-"));
     const env = { ...process.env, OPENCLAW_STATE_DIR: stateDir };

@@ -1,9 +1,17 @@
 // Workboard tests cover dispatcher plugin behavior.
 import { describe, expect, it, vi } from "vitest";
 import { cleanupWorkboardRunWorktree } from "./dispatcher-workspace.js";
-import { dispatchAndStartWorkboardCards } from "./dispatcher.js";
+import { dispatchAndStartWorkboardCards as dispatchCards } from "./dispatcher.js";
 import type { PersistedWorkboardCard, WorkboardKeyedStore } from "./persistence-types.js";
 import { WorkboardStore } from "./store.js";
+
+const dispatchAndStartWorkboardCards = (
+  params: Parameters<typeof dispatchCards>[0],
+): ReturnType<typeof dispatchCards> =>
+  dispatchCards({
+    ...params,
+    options: { resolveDefaultAgentId: () => "main", ...params.options },
+  });
 
 function createMemoryStore<T = PersistedWorkboardCard>(): WorkboardKeyedStore<T> {
   const entries = new Map<string, T>();
