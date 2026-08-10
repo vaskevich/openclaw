@@ -3856,13 +3856,15 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
     );
 
     expect(capturedReplyOptions?.commentaryProgressEnabled).toBe(true);
-    expect(capturedReplyOptions?.commentaryPayloadsEnabled).toBeUndefined();
+    expect(capturedReplyOptions?.commentaryPayloadsEnabled).toBe(true);
+    expect(capturedReplyOptions?.shouldDeliverCommentaryPayloads?.()).toBe(false);
     expect(capturedReplyOptions?.suppressDefaultToolProgressMessages).toBe(true);
     expect(draftStream.update).toHaveBeenLastCalledWith("_Preparing the smallest fix_");
     expect(draftStream.update.mock.calls.flat().join("\n")).not.toContain("pnpm test");
 
     const updateCount = draftStream.update.mock.calls.length;
     capturedReplyOptions?.onVerboseProgressVisibility?.(() => true);
+    expect(capturedReplyOptions?.shouldDeliverCommentaryPayloads?.()).toBe(true);
     await requireCapturedItemEventHandler()({
       kind: "preamble",
       itemId: "preamble-3",
@@ -4071,6 +4073,8 @@ describe("dispatchPreparedSlackMessage preview fallback", () => {
     );
 
     expect(capturedReplyOptions?.commentaryProgressEnabled).toBeUndefined();
+    expect(capturedReplyOptions?.commentaryPayloadsEnabled).toBeUndefined();
+    expect(capturedReplyOptions?.shouldDeliverCommentaryPayloads).toBeUndefined();
     expect(capturedReplyOptions?.onVerboseProgressVisibility).toBeUndefined();
     expect(capturedReplyOptions?.progressPreambleEnabled).toBe(true);
     expect(draftStream.update).toHaveBeenLastCalledWith(
