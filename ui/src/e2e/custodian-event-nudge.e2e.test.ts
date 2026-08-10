@@ -3,6 +3,7 @@ import { mkdir } from "node:fs/promises";
 import path from "node:path";
 import type { Page } from "playwright";
 import { expect, it } from "vitest";
+import { GATEWAY_SERVER_CAPS } from "../../../packages/gateway-protocol/src/index.js";
 import { installMockGateway } from "../test-helpers/control-ui-e2e.ts";
 import { createControlUiE2eSuite } from "./control-ui-e2e-suite.test-support.ts";
 
@@ -295,6 +296,7 @@ suite.define(() => {
       },
       async ({ page }) => {
         const gateway = await installMockGateway(page, {
+          featureCapabilities: [GATEWAY_SERVER_CAPS.SYSTEM_AGENT_WIZARD_CANCEL],
           featureMethods: ["chat.metadata", "chat.startup", "openclaw.chat"],
           methodResponses: {
             "openclaw.chat": {
@@ -361,6 +363,7 @@ suite.define(() => {
           { width: 1440, height: 900, name: "desktop" },
         ]) {
           await page.setViewportSize(viewport);
+          await settleUi(page);
           const [continueBox, cancelBox] = await Promise.all([
             continueButton.boundingBox(),
             cancelButton.boundingBox(),
@@ -368,7 +371,10 @@ suite.define(() => {
           expect(cancelBox).not.toBeNull();
           expect(continueBox).not.toBeNull();
           expect(cancelBox!.x).toBeLessThan(continueBox!.x);
-          expect(Math.abs(cancelBox!.y - continueBox!.y)).toBeLessThan(1);
+          expect(
+            Math.abs(cancelBox!.y - continueBox!.y),
+            JSON.stringify({ viewport, cancelBox, continueBox }),
+          ).toBeLessThan(1);
           expect(
             await page.evaluate(
               () => document.documentElement.scrollWidth <= document.documentElement.clientWidth,
