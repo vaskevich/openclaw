@@ -29,7 +29,7 @@ const {
 }));
 
 vi.mock("./config-validation.js", () => ({
-  requireValidConfigSnapshot: requireValidConfigMock,
+  requireValidConfig: requireValidConfigMock,
 }));
 
 vi.mock("./agents.providers.js", () => ({
