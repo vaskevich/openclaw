@@ -26,6 +26,7 @@ import type { WizardSession } from "../../wizard/session.js";
 import type { AgentRuntimeIdentity } from "../agent-runtime-identity-token.js";
 import type { ChatAbortControllerEntry } from "../chat-abort.js";
 import type { GatewayHotReloadStatus } from "../config-reload-status.types.js";
+import type { ScopeUpgradeCoordinator } from "../device-scope-upgrade.js";
 import type { ExecApprovalManager, ExecApprovalRecord } from "../exec-approval-manager.js";
 import type { HealthSummary } from "../health/types.js";
 import type { GatewayMethodRegistryView } from "../methods/descriptor.js";
@@ -194,6 +195,7 @@ export type GatewayRequestContext = {
   resolveTerminalLaunchPolicy: (agentId?: string) => TerminalLaunchResolution;
   isTerminalEnabled: () => boolean;
   execApprovalManager?: ExecApprovalManager;
+  scopeUpgradeCoordinator?: ScopeUpgradeCoordinator;
   /** Cancels durable approvals owned by one actively aborted run. */
   cancelRunBoundApprovals?: (runId: string) => number;
   pluginApprovalManager?: ExecApprovalManager<PluginApprovalRequestPayload>;
