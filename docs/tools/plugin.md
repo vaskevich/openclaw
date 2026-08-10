@@ -150,9 +150,10 @@ the staged source path and can allow, warn, or block the install. It covers both
 and Gateway-backed install/update paths. CLI plugin and skill commands can
 acknowledge a warning interactively by typing the target name with the same
 copy as suspicious ClawHub releases; policy is then re-evaluated. Reviewed
-non-interactive commands can use `--dangerously-force-unsafe-install`.
+non-interactive commands can use `--acknowledge-install-policy-warning`.
 Gateway-backed and automatic installs remain blocked on
-warnings because they have no operator-confirmation flow. Plugin
+warnings because they have no operator-confirmation flow. The deprecated
+`--dangerously-force-unsafe-install` flag remains a no-op. Plugin
 `before_install` hooks run later, and only in OpenClaw processes where plugin
 hooks are loaded, so use `security.installPolicy` for operator-owned install
 decisions instead. The flag does not override a block, policy failure, or

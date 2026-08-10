@@ -35,7 +35,7 @@ type InstallScanLogger = {
 
 const FULL_GIT_COMMIT_PATTERN = /^[0-9a-f]{40}$/i;
 const INSTALL_POLICY_BLOCK_REASON_PREFIX = "blocked by install policy: ";
-const INSTALL_POLICY_FORCE_FLAG = "--dangerously-force-unsafe-install";
+const INSTALL_POLICY_ACKNOWLEDGEMENT_FLAG = "--acknowledge-install-policy-warning";
 
 type PluginInstallRequestKind = Exclude<InstallPolicyRequestKind, "skill-install">;
 
@@ -1006,7 +1006,7 @@ async function runOperatorInstallPolicy(params: {
     logPolicyResult(result);
     return undefined;
   }
-  if (!params.dangerouslyForceUnsafeInstall && !params.onInstallPolicyWarning) {
+  if (!params.onInstallPolicyWarning) {
     return {
       blocked: {
         code: "security_scan_blocked",
@@ -1016,7 +1016,7 @@ async function runOperatorInstallPolicy(params: {
           guidance: [
             "To continue:",
             "  • Rerun interactively and approve the warning.",
-            `  • For reviewed automation, add ${INSTALL_POLICY_FORCE_FLAG}.`,
+            `  • For reviewed automation, add ${INSTALL_POLICY_ACKNOWLEDGEMENT_FLAG}.`,
           ],
           reason: result.warning.reason,
           targetName: params.targetName,
@@ -1026,13 +1026,11 @@ async function runOperatorInstallPolicy(params: {
     };
   }
   logPolicyResult(result);
-  const acknowledged =
-    params.dangerouslyForceUnsafeInstall ||
-    (await params.onInstallPolicyWarning?.({
-      targetName: params.targetName,
-      targetType: params.targetType,
-      requestMode: params.requestMode,
-    }));
+  const acknowledged = await params.onInstallPolicyWarning({
+    targetName: params.targetName,
+    targetType: params.targetType,
+    requestMode: params.requestMode,
+  });
   if (acknowledged) {
     const reevaluated = await evaluatePolicy();
     if (reevaluated?.blocked) {
