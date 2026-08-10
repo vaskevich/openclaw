@@ -9,6 +9,7 @@ import {
 import { resolveSessionAgentId } from "../../agents/agent-scope.js";
 import { copyReplyPayloadMetadata, type ReplyPayload } from "../../auto-reply/reply-payload.js";
 import { normalizeReplyPayload } from "../../auto-reply/reply/normalize-reply.js";
+import { resolvePendingFinalDeliverySendParams } from "../../auto-reply/reply/pending-final-delivery-send.js";
 import { createReplyMediaPathNormalizer } from "../../auto-reply/reply/reply-media-paths.runtime.js";
 import { formatBtwTextForExternalDelivery } from "../../auto-reply/reply/reply-payloads-base.js";
 import {
@@ -547,6 +548,7 @@ export async function deliverAgentCommandResult(
 ): Promise<AgentCommandDeliveryResult> {
   params.assertDeliveryCurrent?.();
   const { cfg, deps, runtime, opts, outboundSession, sessionEntry, payloads, result } = params;
+  const pendingFinalDelivery = resolvePendingFinalDeliverySendParams(payloads);
   const effectiveSessionKey = outboundSession?.key ?? opts.sessionKey;
   const deliveryAgentId =
     outboundSession?.agentId ??
@@ -958,6 +960,7 @@ export async function deliverAgentCommandResult(
           onDeliveryIntent: restartAbort.dispose,
           onError: logDeliveryError,
           onPayload: logPayload,
+          ...pendingFinalDelivery,
           deps: createOutboundSendDeps(deps),
         });
       } finally {

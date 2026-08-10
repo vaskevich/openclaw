@@ -8,6 +8,7 @@ import {
   isProvenDeliveryNotSentError,
 } from "../../infra/delivery-recovery.shared.js";
 import { collectErrorGraphCandidates } from "../../infra/errors.js";
+import { settlePendingFinalDelivery } from "../../infra/outbound/delivery-completion.js";
 import { generateSecureInt } from "../../infra/secure-random.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
 import type { SilentReplyConversationType } from "../../shared/silent-reply-policy.js";
@@ -266,6 +267,21 @@ function buildReplyDispatchRuntimeInfo(
   };
 }
 
+async function settleReplyPendingFinal(
+  payload: ReplyPayload,
+  state: "prepared" | "queued" | "delivered" | "suppressed" | "unknown",
+  expectedState?: "prepared" | "queued",
+) {
+  const completion = getReplyPayloadMetadata(payload)?.pendingFinalDeliveryCompletion;
+  return completion
+    ? await settlePendingFinalDelivery(
+        { kind: "pending-final", ...completion },
+        state,
+        expectedState,
+      )
+    : undefined;
+}
+
 /** Generate a random delay within the configured range. */
 function getHumanDelay(config: HumanDelayConfig | undefined): number {
   const mode = config?.mode ?? "off";
@@ -458,21 +474,36 @@ export function createReplyDispatcher(options: ReplyDispatcherOptions): ReplyDis
           throw error;
         }
         if (!deliverPayload) {
+          await settleReplyPendingFinal(payload, "suppressed", "prepared");
           await notifyBeforeDeliverCancelled(payload, info);
           return "cancelled";
         }
         deliverPayload = copyReplyPayloadMetadata(payload, deliverPayload);
       }
+      const admission = await settleReplyPendingFinal(deliverPayload, "queued", "prepared");
+      if (admission && admission.state !== "queued") {
+        return "cancelled";
+      }
       deliveryStarted = true;
       await options.deliver(deliverPayload, info);
+      await settleReplyPendingFinal(deliverPayload, "delivered");
       return "delivered";
     } catch (error) {
+      const outcome =
+        deliveryStarted && !isRetryableNoSendFailure(error)
+          ? "failed-deliver"
+          : "failed-before-deliver";
+      if (deliveryStarted) {
+        await settleReplyPendingFinal(
+          deliverPayload,
+          outcome === "failed-before-deliver" ? "prepared" : "unknown",
+          outcome === "failed-before-deliver" ? "queued" : undefined,
+        );
+      }
       try {
         await options.onError?.(error, info);
       } catch {}
-      return deliveryStarted && !isRetryableNoSendFailure(error)
-        ? "failed-deliver"
-        : "failed-before-deliver";
+      return outcome;
     }
   };
 

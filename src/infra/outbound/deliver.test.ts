@@ -96,6 +96,7 @@ const queueMocks = vi.hoisted(() => ({
 }));
 const completionMocks = vi.hoisted(() => ({
   completeDurableDelivery: vi.fn(),
+  markDurableDeliveryQueued: vi.fn(async () => ({ state: "queued" as const })),
   rejectDurableDelivery: vi.fn(),
   suppressDurableDelivery: vi.fn(),
 }));
@@ -207,6 +208,7 @@ vi.mock("./delivery-queue.js", () => ({
 }));
 vi.mock("./delivery-completion.js", () => ({
   completeDurableDelivery: completionMocks.completeDurableDelivery,
+  markDurableDeliveryQueued: completionMocks.markDurableDeliveryQueued,
   rejectDurableDelivery: completionMocks.rejectDurableDelivery,
   suppressDurableDelivery: completionMocks.suppressDurableDelivery,
 }));
@@ -521,6 +523,7 @@ describe("deliverOutboundPayloads", () => {
       },
     );
     completionMocks.completeDurableDelivery.mockClear();
+    completionMocks.markDurableDeliveryQueued.mockClear();
     completionMocks.rejectDurableDelivery.mockClear();
     completionMocks.suppressDurableDelivery.mockClear();
     queueMocks.ackDelivery.mockClear();
@@ -1063,6 +1066,7 @@ describe("deliverOutboundPayloads", () => {
     expect(completionMocks.completeDurableDelivery).toHaveBeenCalledWith(
       expect.objectContaining({ operationId: "operation-chunked" }),
       expect.objectContaining({ messageId: "chunk-2" }),
+      undefined,
     );
   });
 
@@ -2169,6 +2173,7 @@ describe("deliverOutboundPayloads", () => {
     expect(completionMocks.rejectDurableDelivery).toHaveBeenCalledWith(
       expect.objectContaining({ operationId: "operation-rejected" }),
       "atomic message limit",
+      undefined,
     );
     expect(queueMocks.failDeliveryBeforePlatformSend).not.toHaveBeenCalled();
     expect(queueMocks.failDelivery).not.toHaveBeenCalled();
@@ -2206,6 +2211,7 @@ describe("deliverOutboundPayloads", () => {
     expect(completionMocks.rejectDurableDelivery).toHaveBeenCalledWith(
       expect.objectContaining({ operationId: "operation-empty-rejection" }),
       "Platform rejected the message before dispatch",
+      undefined,
     );
   });
 

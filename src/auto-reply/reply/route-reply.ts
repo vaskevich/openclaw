@@ -26,6 +26,7 @@ import { getReplyPayloadMetadata, type ReplyDeliveryContext } from "../reply-pay
 import type { OriginatingChannelType } from "../templating.js";
 import type { ReplyPayload } from "../types.js";
 import { normalizeReplyPayload } from "./normalize-reply.js";
+import { resolvePendingFinalDeliverySendParams } from "./pending-final-delivery-send.js";
 import type { ReplyDispatchKind } from "./reply-dispatcher.types.js";
 import {
   formatBtwTextForExternalDelivery,
@@ -174,6 +175,7 @@ function summarizeVisibleRouteReplyDelivery(
  */
 export async function routeReply(params: RouteReplyParams): Promise<RouteReplyResult> {
   const { payload, channel, to, accountId, threadId, cfg, abortSignal } = params;
+  const pendingFinalDelivery = resolvePendingFinalDeliverySendParams([payload]);
   if (shouldSuppressReasoningPayload(payload)) {
     return {
       ok: true,
@@ -348,6 +350,7 @@ export async function routeReply(params: RouteReplyParams): Promise<RouteReplyRe
       threadId: resolvedThreadId,
       session: outboundSession,
       signal: abortSignal,
+      ...pendingFinalDelivery,
       mirror:
         params.mirror !== false && params.sessionKey
           ? {

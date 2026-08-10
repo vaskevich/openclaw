@@ -1,6 +1,7 @@
 // Durable final-reply delivery for inbound channel turns.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import type { ReplyPayload } from "../../auto-reply/reply-payload.js";
+import { resolvePendingFinalDeliverySendParams } from "../../auto-reply/reply/pending-final-delivery-send.js";
 import type { FinalizedMsgContext } from "../../auto-reply/templating.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
 import { normalizeDeliverableOutboundChannel } from "../../infra/outbound/channel-resolution.js";
@@ -171,8 +172,10 @@ export async function deliverInboundReplyWithMessageSendContext(
       threadId,
       silent: params.silent,
     });
+  const pendingFinalDelivery = resolvePendingFinalDeliverySendParams([params.payload]);
   const durability =
-    requiredCapabilities.reconcileUnknownSend === true ? "required" : "best_effort";
+    pendingFinalDelivery.durability ??
+    (requiredCapabilities.reconcileUnknownSend === true ? "required" : "best_effort");
 
   let support: Awaited<ReturnType<typeof resolveOutboundDurableFinalDeliverySupport>>;
   try {
@@ -204,7 +207,6 @@ export async function deliverInboundReplyWithMessageSendContext(
     requesterSenderUsername: params.ctxPayload.SenderUsername,
     requesterSenderE164: params.ctxPayload.SenderE164,
   });
-
   const send = await sendDurableMessageBatch({
     cfg: params.cfg,
     channel,
@@ -220,9 +222,12 @@ export async function deliverInboundReplyWithMessageSendContext(
     mediaAccess: params.mediaAccess,
     silent: params.silent,
     durability,
-    ...(durability === "required" ? { requireUnknownSendReconciliation: true } : {}),
+    ...(requiredCapabilities.reconcileUnknownSend === true
+      ? { requireUnknownSendReconciliation: true }
+      : {}),
     session,
     gatewayClientScopes: params.ctxPayload.GatewayClientScopes ?? [],
+    ...pendingFinalDelivery,
   });
   if (send.status === "failed") {
     return { status: "failed" as const, error: send.error };
