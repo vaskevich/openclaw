@@ -49,7 +49,7 @@ type TemporaryRefParams = {
   evidenceVerified: boolean;
 };
 
-function isRecord(value: unknown): value is Record<string, unknown> {
+function isJsonRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
@@ -349,8 +349,8 @@ function findLatestRunId(branch: string, sha: string) {
   if (!Array.isArray(runs)) {
     throw new Error("Full Release Validation run list response was not an array");
   }
-  const match = runs.find((runItem: unknown) => isRecord(runItem) && runItem.headSha === sha);
-  const databaseId = isRecord(match) ? match.databaseId : undefined;
+  const match = runs.find((runItem: unknown) => isJsonRecord(runItem) && runItem.headSha === sha);
+  const databaseId = isJsonRecord(match) ? match.databaseId : undefined;
   return typeof databaseId === "string" || typeof databaseId === "number" ? String(databaseId) : "";
 }
 
@@ -361,7 +361,7 @@ function readWorkflowRun(parentRunId: string, workflowSha: string) {
   const workflowRun: unknown = JSON.parse(
     execGhRead(["api", `repos/openclaw/openclaw/actions/runs/${parentRunId}`], GH_READ_OPTIONS),
   );
-  if (!isRecord(workflowRun)) {
+  if (!isJsonRecord(workflowRun)) {
     throw new Error(`Full Release Validation run ${parentRunId} returned an invalid response`);
   }
   if (workflowRun.head_sha !== workflowSha) {
@@ -470,10 +470,10 @@ function verifyReleaseEvidence(parentRunId: string, workflowSha: string) {
       run(process.execPath, [verifier, ...releaseEvidenceVerificationArgs(parentRunId)]),
     );
     if (
-      !isRecord(evidence) ||
+      !isJsonRecord(evidence) ||
       evidence.valid !== true ||
-      !isRecord(evidence.current) ||
-      !isRecord(evidence.root)
+      !isJsonRecord(evidence.current) ||
+      !isJsonRecord(evidence.root)
     ) {
       throw new Error(`Full Release Validation evidence is invalid for run ${parentRunId}.`);
     }

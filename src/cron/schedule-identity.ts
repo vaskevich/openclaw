@@ -9,11 +9,11 @@ type CronScheduleIdentityInput = { schedule?: unknown; enabled?: unknown } & Rec
   unknown
 >;
 
-function readString(record: Record<string, unknown>, key: string): string | undefined {
+function readScheduleString(record: Record<string, unknown>, key: string): string | undefined {
   return normalizeOptionalString(record[key]);
 }
 
-function readNumber(record: Record<string, unknown>, key: string): number | undefined {
+function readScheduleNumber(record: Record<string, unknown>, key: string): number | undefined {
   return coerceFiniteScheduleNumber(record[key]);
 }
 
@@ -36,12 +36,12 @@ function schedulePayloadFromRecord(schedule: Record<string, unknown>):
       maxBatchBytes?: number;
     }
   | undefined {
-  const rawKind = readString(schedule, "kind")?.toLowerCase();
-  const expr = readString(schedule, "expr");
-  const at = readString(schedule, "at");
-  const everyMs = readNumber(schedule, "everyMs");
-  const anchorMs = readNumber(schedule, "anchorMs");
-  const tz = readString(schedule, "tz");
+  const rawKind = readScheduleString(schedule, "kind")?.toLowerCase();
+  const expr = readScheduleString(schedule, "expr");
+  const at = readScheduleString(schedule, "at");
+  const everyMs = readScheduleNumber(schedule, "everyMs");
+  const anchorMs = readScheduleNumber(schedule, "anchorMs");
+  const tz = readScheduleString(schedule, "tz");
   const staggerMs = readStaggerMs(schedule);
   const kind =
     // Infer legacy shorthand schedule shapes when kind is missing so timer
@@ -70,8 +70,10 @@ function schedulePayloadFromRecord(schedule: Record<string, unknown>):
     return { kind: "cron", expr, tz, staggerMs };
   }
   if (kind === "on-exit") {
-    const command = readString(schedule, "command");
-    return command ? { kind: "on-exit", command, cwd: readString(schedule, "cwd") } : undefined;
+    const command = readScheduleString(schedule, "command");
+    return command
+      ? { kind: "on-exit", command, cwd: readScheduleString(schedule, "cwd") }
+      : undefined;
   }
   if (kind === "stream") {
     const command = schedule.command;
@@ -82,15 +84,15 @@ function schedulePayloadFromRecord(schedule: Record<string, unknown>):
     ) {
       return undefined;
     }
-    const mode = readString(schedule, "mode");
+    const mode = readScheduleString(schedule, "mode");
     return {
       kind: "stream",
       command: [...command],
-      cwd: readString(schedule, "cwd"),
+      cwd: readScheduleString(schedule, "cwd"),
       mode: mode === "line" || mode === "match" ? mode : undefined,
       match: typeof schedule.match === "string" ? schedule.match : undefined,
-      batchMs: readNumber(schedule, "batchMs"),
-      maxBatchBytes: readNumber(schedule, "maxBatchBytes"),
+      batchMs: readScheduleNumber(schedule, "batchMs"),
+      maxBatchBytes: readScheduleNumber(schedule, "maxBatchBytes"),
     };
   }
   return undefined;

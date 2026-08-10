@@ -3,6 +3,7 @@ import { mkdir, writeFile } from "node:fs/promises";
 import { createServer, type IncomingMessage } from "node:http";
 import net from "node:net";
 import path from "node:path";
+import { asNullableRecord } from "@openclaw/normalization-core/record-coerce";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { WebSocket, WebSocketServer, type RawData } from "ws";
@@ -91,12 +92,6 @@ let gateway: RealGateway;
 let proxy: RealTransportProxy;
 const openContexts = new Set<BrowserContext>();
 
-function asRecord(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : null;
-}
-
 function stringValue(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
@@ -114,7 +109,7 @@ function parseJsonFrame(data: RawData): Record<string, unknown> | null {
       : data instanceof ArrayBuffer
         ? Buffer.from(data).toString("utf8")
         : data.toString("utf8");
-    return asRecord(JSON.parse(text));
+    return asNullableRecord(JSON.parse(text));
   } catch {
     return null;
   }
@@ -127,14 +122,14 @@ function captureBrowserConnect(
   if (frame.type !== "req" || frame.method !== "connect") {
     return null;
   }
-  const params = asRecord(frame.params);
-  const client = asRecord(params?.client);
-  const auth = asRecord(params?.auth);
+  const params = asNullableRecord(frame.params);
+  const client = asNullableRecord(params?.client);
+  const auth = asNullableRecord(params?.auth);
   evidence.browserConnect = {
     authFields: auth ? Object.keys(auth).toSorted() : [],
     clientId: stringValue(client?.id),
     clientMode: stringValue(client?.mode),
-    hasDevice: asRecord(params?.device) !== null,
+    hasDevice: asNullableRecord(params?.device) !== null,
     scopes: stringArray(params?.scopes).toSorted(),
   };
   return stringValue(frame.id);
@@ -148,9 +143,9 @@ function captureGatewayResult(
   if (frame.type !== "res" || stringValue(frame.id) !== connectRequestId) {
     return;
   }
-  const error = asRecord(frame.error);
-  const details = asRecord(error?.details);
-  const payload = asRecord(frame.payload);
+  const error = asNullableRecord(frame.error);
+  const details = asNullableRecord(error?.details);
+  const payload = asNullableRecord(frame.payload);
   evidence.gatewayResult = {
     errorCode: stringValue(details?.code) ?? stringValue(error?.code),
     errorReason: stringValue(details?.authReason) ?? stringValue(details?.reason),
