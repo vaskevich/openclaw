@@ -588,7 +588,7 @@ export const en: TranslationMap = {
       rotateWithheldTitle: "Token rotated · {device}",
       rotateWithheldNext:
         "It will reconnect with the new token automatically — nothing else to do.",
-      rotateWithheldException: "If it can only sign in with its device token, pair it again.",
+      rotateWithheldException: "If it doesn't reconnect on its own, pair it again.",
       rotateWithheldNote: "For security, the new token is only revealed on the device itself.",
       gateway: "gateway",
       unpaired: "unpaired",

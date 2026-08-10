@@ -489,7 +489,8 @@ describe("DevicesPage gateway lifecycle", () => {
     );
     expect(document.body.textContent).toContain("Mac Studio");
     expect(document.body.textContent).toContain(t("devices.inventory.rotateWithheldNext"));
-    // The one actionable branch is a callout, not a fourth sentence in the calm block.
+    // The one actionable branch is a callout, keyed to a symptom the operator can see
+    // rather than to which credential the device happens to hold.
     expect(document.body.querySelector(".secret-reveal__callout")?.textContent).toContain(
       t("devices.inventory.rotateWithheldException"),
     );
