@@ -1005,11 +1005,7 @@ async function runOperatorInstallPolicy(params: {
     logPolicyResult(result);
     return undefined;
   }
-  if (params.dangerouslyForceUnsafeInstall) {
-    logPolicyResult(result);
-    return undefined;
-  }
-  if (!params.onInstallPolicyWarning) {
+  if (!params.dangerouslyForceUnsafeInstall && !params.onInstallPolicyWarning) {
     return {
       blocked: {
         code: "security_scan_blocked",
@@ -1029,11 +1025,13 @@ async function runOperatorInstallPolicy(params: {
     };
   }
   logPolicyResult(result);
-  const acknowledged = await params.onInstallPolicyWarning({
-    targetName: params.targetName,
-    targetType: params.targetType,
-    requestMode: params.requestMode,
-  });
+  const acknowledged =
+    params.dangerouslyForceUnsafeInstall ||
+    (await params.onInstallPolicyWarning?.({
+      targetName: params.targetName,
+      targetType: params.targetType,
+      requestMode: params.requestMode,
+    }));
   if (acknowledged) {
     const reevaluated = await evaluatePolicy();
     if (reevaluated?.blocked) {
