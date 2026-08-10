@@ -17,10 +17,7 @@ import {
   SYSTEM_AGENT_APPROVAL_TIMEOUT_MS,
   type SystemAgentApprovalRequestPayload,
 } from "../../infra/system-agent-approvals.js";
-import { KeyedAsyncQueue } from "../../plugin-sdk/keyed-async-queue.js";
-import { enqueueCommandInLane, setCommandLaneConcurrency } from "../../process/command-queue.js";
 import { runWithGatewayIndependentRootWorkContinuation } from "../../process/gateway-work-admission.js";
-import { CommandLane } from "../../process/lanes.js";
 import { defaultRuntime } from "../../runtime.js";
 import {
   SystemAgentChatEngine,
@@ -56,6 +53,7 @@ import {
   getSystemAgentChatInputError,
   runSystemAgentChatInput,
 } from "./system-agent-chat-turn.js";
+import { runSystemAgentGatewayTask } from "./system-agent-gateway-queue.js";
 import { getSystemAgentSessionQueue } from "./system-agent-session-queue.js";
 import type { GatewayRequestContext, GatewayRequestHandlers } from "./types.js";
 import { assertValidParams } from "./validation.js";
@@ -77,8 +75,6 @@ const MAX_SYSTEM_AGENT_SESSIONS = 8;
 const SYSTEM_AGENT_SEED_HISTORY_LIMIT = 30;
 const PROVIDER_AUTH_SESSION_TIMEOUT_MS = 25 * 60 * 1000;
 const PROVIDER_PREPARE_SESSION_TIMEOUT_MS = 2 * 60 * 60 * 1000;
-const SYSTEM_AGENT_GATEWAY_EXECUTION_KEY = "gateway";
-const systemAgentGatewayExecutionQueue = new KeyedAsyncQueue();
 
 function acknowledgeDeliveredSystemAgentWelcome(session: SystemAgentChatSession): void {
   const auditSequence = session.welcomeAuditSequence;
@@ -87,18 +83,6 @@ function acknowledgeDeliveredSystemAgentWelcome(session: SystemAgentChatSession)
   }
   acknowledgeSystemAgentGreetingDelivery({ auditSequence });
   delete session.welcomeAuditSequence;
-}
-
-async function runSystemAgentGatewayTask<T>(task: () => Promise<T>): Promise<T> {
-  // Track every accepted RPC as active, never queued: restart draining snapshots
-  // active ids, so a queued OpenClaw request could otherwise outlive its socket.
-  setCommandLaneConcurrency(CommandLane.SystemAgent, Number.MAX_SAFE_INTEGER);
-  return await enqueueCommandInLane(CommandLane.SystemAgent, () =>
-    // Bound expensive detection, activation, and agent turns without hiding
-    // accepted work from restart draining. This also makes session eviction and
-    // setup writes atomic with respect to other OpenClaw gateway requests.
-    systemAgentGatewayExecutionQueue.enqueue(SYSTEM_AGENT_GATEWAY_EXECUTION_KEY, task),
-  );
 }
 
 let systemAgentSetupActivationInProgress = false;

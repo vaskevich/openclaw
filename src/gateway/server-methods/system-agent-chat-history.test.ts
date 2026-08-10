@@ -1,11 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../test/helpers/promise.js";
 import { appendTranscriptTurn } from "../../system-agent/transcript-store.js";
-import { createDeferred } from "../../test-utils/deferred.js";
 import {
   captureSystemAgentWizardAction,
   persistSystemAgentEngineHistory,
   systemAgentChatHistoryHandler,
 } from "./system-agent-chat-history.js";
+import { runSystemAgentGatewayTask } from "./system-agent-gateway-queue.js";
 import { getSystemAgentSessionQueue } from "./system-agent-session-queue.js";
 import type { GatewayClient } from "./types.js";
 
@@ -200,6 +201,32 @@ describe("openclaw.chat.history wizard recovery", () => {
             { role: "assistant", text: "committed reply", at: 3 },
           ],
         },
+        error: undefined,
+      },
+    ]);
+  });
+
+  it("waits for the global Gateway queue before recovering a session", async () => {
+    const taskStarted = createDeferred();
+    const releaseTask = createDeferred();
+    const invocation = makeInvocation({ sessionId: "recover-session" });
+    const globalTask = runSystemAgentGatewayTask(async () => {
+      taskStarted.resolve();
+      await releaseTask.promise;
+    });
+    await taskStarted.promise;
+
+    const history = systemAgentChatHistoryHandler(invocation.options);
+    await Promise.resolve();
+    expect(invocation.calls).toEqual([]);
+
+    releaseTask.resolve();
+    await Promise.all([globalTask, history]);
+
+    expect(invocation.calls).toEqual([
+      {
+        ok: true,
+        payload: { turns },
         error: undefined,
       },
     ]);

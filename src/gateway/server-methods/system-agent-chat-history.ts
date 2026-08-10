@@ -6,6 +6,7 @@ import {
 import type { SystemAgentChatEngine } from "../../system-agent/chat-engine.js";
 import { resolveSystemAgentDelegationKey } from "../../system-agent/delegation-session.js";
 import { appendTranscriptTurn, readTranscriptTail } from "../../system-agent/transcript-store.js";
+import { runSystemAgentGatewayTask } from "./system-agent-gateway-queue.js";
 import { getSystemAgentSessionQueue } from "./system-agent-session-queue.js";
 import type { GatewayClient, GatewayRequestHandler } from "./types.js";
 import { assertValidParams } from "./validation.js";
@@ -96,18 +97,23 @@ export const systemAgentChatHistoryHandler: GatewayRequestHandler = async ({
   const ownerKey = resolveSystemAgentSessionOwnerKey({ client });
   const recovery =
     requestedSessionId && session && ownerKey === session.ownerKey
-      ? await getSystemAgentSessionQueue(context.systemAgentSessions).enqueue(
-          requestedSessionId,
-          async () => {
-            if (context.systemAgentSessions.get(requestedSessionId) !== session) {
-              return undefined;
-            }
-            session.lastUsedAt = Date.now();
-            return {
-              turns: readTranscriptTail(params.limit ?? DEFAULT_SYSTEM_AGENT_HISTORY_LIMIT),
-              step: await session.engine.activeWizardStep(),
-            };
-          },
+      ? await runSystemAgentGatewayTask(
+          async () =>
+            await getSystemAgentSessionQueue(context.systemAgentSessions).enqueue(
+              requestedSessionId,
+              async () => {
+                if (context.systemAgentSessions.get(requestedSessionId) !== session) {
+                  return undefined;
+                }
+                session.lastUsedAt = Date.now();
+                return {
+                  turns: readTranscriptTail(params.limit ?? DEFAULT_SYSTEM_AGENT_HISTORY_LIMIT, {
+                    sessionId: requestedSessionId,
+                  }),
+                  step: await session.engine.activeWizardStep(),
+                };
+              },
+            ),
         )
       : undefined;
   const turns =

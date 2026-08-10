@@ -342,7 +342,7 @@ describe("promptSingleChannelSecretInput", () => {
       preferredEnvVar: "TELEGRAM_BOT_TOKEN",
     });
 
-    expect(result).toEqual({ action: "use-env", inputMode: "plaintext" });
+    expect(result).toEqual({ action: "use-env" });
   });
 
   it("returns ref + resolved value when external env ref is selected", async () => {
@@ -364,7 +364,6 @@ describe("promptSingleChannelSecretInput", () => {
 
     expect(result).toEqual({
       action: "set",
-      inputMode: "ref",
       value: {
         source: "env",
         provider: "default",
@@ -390,7 +389,7 @@ describe("promptSingleChannelSecretInput", () => {
       preferredEnvVar: "TELEGRAM_BOT_TOKEN",
     });
 
-    expect(result).toEqual({ action: "keep", inputMode: "ref" });
+    expect(result).toEqual({ action: "keep" });
     expect(prompter.text).not.toHaveBeenCalled();
   });
 });

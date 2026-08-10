@@ -9,6 +9,7 @@ import { DEFAULT_ACCOUNT_ID, normalizeAccountId } from "../../routing/session-ke
 import { resolveChannelSetupExecutionAdapter } from "./setup-contract.js";
 import { configureChannelAccessWithAllowlist } from "./setup-group-access-configure.js";
 import { moveSingleAccountChannelSectionToDefaultAccount } from "./setup-helpers.js";
+import { resolveSharedChannelCredentialInputMode } from "./setup-wizard-credential-mode.js";
 import {
   promptResolvedAllowFrom,
   resolveAccountIdForConfigure,
@@ -402,6 +403,13 @@ export function buildChannelSetupWizardAdapterFromSetupWizard(params: {
           }
           const allowEnv = credential.allowEnv?.({ cfg: next, accountId }) ?? false;
 
+          if (!secretInputMode && wizard.credentials.length > 1) {
+            secretInputMode = await resolveSharedChannelCredentialInputMode({
+              prompter,
+              credentialLabel: credential.credentialLabel,
+            });
+          }
+
           const credentialResult = await runSingleChannelSecretStep({
             cfg: next,
             prompter,
@@ -462,7 +470,6 @@ export function buildChannelSetupWizardAdapterFromSetupWizard(params: {
             },
           });
 
-          secretInputMode ??= credentialResult.inputMode;
           next = credentialResult.cfg;
           credentialState = credential.inspect({ cfg: next, accountId });
           resolvedCredentialValue =
