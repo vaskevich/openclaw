@@ -7,6 +7,11 @@ import type {
   ApprovalKind,
   ApprovalPresentation,
 } from "../../packages/gateway-protocol/src/index.js";
+import type {
+  MessagePresentation,
+  MessagePresentationAction,
+  MessagePresentationButton,
+} from "../interactive/payload.js";
 import {
   resolveExecApprovalCommandDisplay,
   sanitizeExecApprovalDisplayText,
@@ -150,4 +155,29 @@ export function buildApprovalPresentation(params: {
   return params.kind === "plugin"
     ? buildPluginApprovalPresentation(params)
     : buildSystemAgentApprovalPresentation(params);
+}
+
+type CommandApprovalActionDescriptor = {
+  label: string;
+  style: NonNullable<MessagePresentationButton["style"]>;
+  action?: MessagePresentationAction;
+  command: string;
+};
+
+/** Build portable command controls from approval action descriptors. */
+export function buildCommandApprovalPresentationFromActions(
+  descriptors: readonly CommandApprovalActionDescriptor[],
+): MessagePresentation | undefined {
+  const buttons = descriptors.map((descriptor) => {
+    const action =
+      descriptor.action ??
+      ({ type: "command", command: descriptor.command } satisfies MessagePresentationAction);
+    return {
+      label: descriptor.label,
+      action,
+      ...(descriptor.action ? {} : { value: descriptor.command }),
+      style: descriptor.style,
+    };
+  });
+  return buttons.length > 0 ? { blocks: [{ type: "buttons", buttons }] } : undefined;
 }

@@ -14,6 +14,7 @@ import { formatHumanList } from "../shared/human-list.js";
 // Builds reply payloads for exec approval prompts and outcomes.
 import { formatFencedCodeBlock } from "../shared/markdown-code.js";
 import { formatApprovalDisplayPath } from "./approval-display-paths.js";
+import { buildCommandApprovalPresentationFromActions } from "./approval-presentation.js";
 import {
   describeNativeExecApprovalClientSetup,
   listNativeExecApprovalClientLabels,
@@ -227,28 +228,11 @@ export function buildTypedApprovalActionDescriptors(
   );
 }
 
-function buildApprovalPresentationButtons(
-  descriptors: readonly ExecApprovalActionDescriptor[],
-): MessagePresentationButton[] {
-  return descriptors.map((descriptor) => {
-    const action =
-      descriptor.action ??
-      ({ type: "command", command: descriptor.command } satisfies MessagePresentationAction);
-    return {
-      label: descriptor.label,
-      action,
-      ...(descriptor.action ? {} : { value: descriptor.command }),
-      style: descriptor.style,
-    };
-  });
-}
-
 /** Build portable approval controls from decision descriptors. */
 export function buildApprovalPresentationFromActionDescriptors(
   actions: readonly ExecApprovalActionDescriptor[],
 ): MessagePresentation | undefined {
-  const buttons = buildApprovalPresentationButtons(actions);
-  return buttons.length > 0 ? { blocks: [{ type: "buttons", buttons }] } : undefined;
+  return buildCommandApprovalPresentationFromActions(actions);
 }
 
 type BuildApprovalPresentationParams = {
@@ -258,7 +242,7 @@ type BuildApprovalPresentationParams = {
 };
 
 /** Build the shipped command-backed portable approval controls. */
-export function buildApprovalPresentation(
+export function buildCommandApprovalPresentation(
   params: BuildApprovalPresentationParams,
 ): MessagePresentation | undefined {
   return buildApprovalPresentationFromActionDescriptors(
@@ -290,7 +274,7 @@ export function buildExecApprovalPresentation(params: {
   ask?: string | null;
   allowedDecisions?: readonly ExecApprovalReplyDecision[];
 }): MessagePresentation | undefined {
-  return buildApprovalPresentation({
+  return buildCommandApprovalPresentation({
     approvalId: params.approvalCommandId,
     ask: params.ask,
     allowedDecisions: params.allowedDecisions,
@@ -440,7 +424,7 @@ export function buildExecApprovalPendingReplyPayload(
 
   return {
     text: lines.join("\n\n"),
-    presentation: buildApprovalPresentation({
+    presentation: buildCommandApprovalPresentation({
       approvalId: params.approvalId,
       allowedDecisions,
     }),
