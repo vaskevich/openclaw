@@ -585,9 +585,13 @@ export const en: TranslationMap = {
         "Copy this token now and store it securely. It is shown once and cannot be recovered.",
       rotateAcknowledge: "I saved this token",
       rotateDismissHint: "This dialog stays open until you confirm the token is saved.",
-      rotateWithheldTitle: "The {role} token was rotated",
-      rotateWithheldBody:
-        "The new token is not shown here: the Gateway returns it only to a device rotating its own token. That device was disconnected and picks up the replacement automatically the next time it connects with your Gateway token or password. A device that can only sign in with its device token has to be paired again.",
+      rotateWithheldTitle: "Token rotated",
+      rotateWithheldOutcome: "{device} has a new {role} token and was signed out.",
+      rotateWithheldNext:
+        "It will reconnect and pick up the new token automatically — nothing else to do.",
+      rotateWithheldException:
+        "If this device can only sign in with its device token, you will need to pair it again.",
+      rotateWithheldNote: "For security, a new token is only revealed on the device itself.",
       gateway: "gateway",
       unpaired: "unpaired",
       unknownClient: "unknown client",

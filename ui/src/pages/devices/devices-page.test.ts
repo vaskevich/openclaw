@@ -43,7 +43,11 @@ type TestDevicesPage = HTMLElement & {
   }) => Promise<void>;
   confirmPairingReject: (target: "device" | "node", requestId: string) => Promise<void>;
   confirmTokenRevoke: (deviceId: string, role: string) => Promise<void>;
-  reportRotationOutcome: (deviceId: string, role: string, scopes?: string[]) => Promise<void>;
+  reportRotationOutcome: (
+    device: { id: string; name: string },
+    role: string,
+    scopes?: string[],
+  ) => Promise<void>;
 };
 
 const ROTATED_TOKEN = "rotated-operator-token";
@@ -393,9 +397,11 @@ describe("DevicesPage gateway lifecycle", () => {
     const page = createConnectedPage(client);
 
     let acknowledged = false;
-    const pending = page.reportRotationOutcome("device-1", "operator").then(() => {
-      acknowledged = true;
-    });
+    const pending = page
+      .reportRotationOutcome({ id: "device-1", name: "MacBook Pro" }, "operator")
+      .then(() => {
+        acknowledged = true;
+      });
     const { dialog } = await waitForRenderedModalDialog(document.body);
 
     expect(dialog.getAttribute("aria-label")).toBe(
@@ -418,9 +424,11 @@ describe("DevicesPage gateway lifecycle", () => {
     const page = createConnectedPage(client);
 
     let acknowledged = false;
-    const pending = page.reportRotationOutcome("device-1", "operator").then(() => {
-      acknowledged = true;
-    });
+    const pending = page
+      .reportRotationOutcome({ id: "device-1", name: "MacBook Pro" }, "operator")
+      .then(() => {
+        acknowledged = true;
+      });
     const { modal, webAwesomeDialog } = await waitForRenderedModalDialog(document.body);
 
     // Escape and backdrop clicks both reach the dialog as a cancelable wa-hide, which
@@ -448,7 +456,7 @@ describe("DevicesPage gateway lifecycle", () => {
     const client = { request } as unknown as GatewayBrowserClient;
     const page = createConnectedPage(client);
 
-    const pending = page.reportRotationOutcome("device-1", "operator");
+    const pending = page.reportRotationOutcome({ id: "device-1", name: "MacBook Pro" }, "operator");
     page.pageState.requestGeneration += 1;
     rotated.resolve({ token: ROTATED_TOKEN, tokenDelivery: "in-band" });
     await waitForRenderedModalDialog(document.body);
@@ -468,13 +476,20 @@ describe("DevicesPage gateway lifecycle", () => {
     const client = rotatingClient(null);
     const page = createConnectedPage(client);
 
-    const pending = page.reportRotationOutcome("device-2", "operator");
+    const pending = page.reportRotationOutcome({ id: "device-2", name: "Mac Studio" }, "operator");
     const { dialog } = await waitForRenderedModalDialog(document.body);
 
-    expect(dialog.getAttribute("aria-label")).toBe(
-      t("devices.inventory.rotateWithheldTitle", { role: "operator" }),
+    expect(dialog.getAttribute("aria-label")).toBe(t("devices.inventory.rotateWithheldTitle"));
+    // Leads with the outcome and names the device the operator clicked, then tells them
+    // the common case needs nothing from them, then the one case that does.
+    expect(document.body.textContent).toContain(
+      t("devices.inventory.rotateWithheldOutcome", { device: "Mac Studio", role: "operator" }),
     );
-    expect(document.body.textContent).toContain(t("devices.inventory.rotateWithheldBody"));
+    expect(document.body.textContent).toContain(t("devices.inventory.rotateWithheldNext"));
+    expect(document.body.textContent).toContain(t("devices.inventory.rotateWithheldException"));
+    expect(document.body.querySelector(".secret-reveal__note")?.textContent).toContain(
+      t("devices.inventory.rotateWithheldNote"),
+    );
     // No secret reached this operator, so there is no value block and nothing to copy.
     expect(document.body.querySelector(".secret-reveal__code")).toBeNull();
     expect(document.body.querySelector(".chat-copy-btn")).toBeNull();
@@ -491,7 +506,7 @@ describe("DevicesPage gateway lifecycle", () => {
     const client = rotatingClient(null);
     const page = createConnectedPage(client);
 
-    const pending = page.reportRotationOutcome("device-2", "operator");
+    const pending = page.reportRotationOutcome({ id: "device-2", name: "Mac Studio" }, "operator");
     const { webAwesomeDialog } = await waitForRenderedModalDialog(document.body);
 
     // Nothing here is unrecoverable, so Escape and backdrop settle it like any dialog
@@ -511,7 +526,7 @@ describe("DevicesPage gateway lifecycle", () => {
     const client = { request } as unknown as GatewayBrowserClient;
     const page = createConnectedPage(client);
 
-    await page.reportRotationOutcome("device-1", "operator");
+    await page.reportRotationOutcome({ id: "device-1", name: "MacBook Pro" }, "operator");
 
     expect(document.body.querySelector("openclaw-modal-dialog")).toBeNull();
     expect(page.pageState.devicesError).toContain("rotate refused");

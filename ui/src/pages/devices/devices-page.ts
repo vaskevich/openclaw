@@ -421,10 +421,14 @@ class DevicesPage extends OpenClawLightDomElement {
   // to this operator, otherwise with what it did instead. The reveal sits deliberately
   // outside pendingConfirmation, which a reconnect aborts — aborting a shown secret
   // would destroy the only copy the Gateway can hand out.
-  private async reportRotationOutcome(deviceId: string, role: string, scopes?: string[]) {
+  private async reportRotationOutcome(
+    device: { id: string; name: string },
+    role: string,
+    scopes?: string[],
+  ) {
     const outcome = await this.runPageTask((pageState) =>
       rotateDeviceToken(pageState, {
-        deviceId,
+        deviceId: device.id,
         gatewayUrl: this.context.gateway.connection.gatewayUrl,
         role,
         scopes,
@@ -442,9 +446,16 @@ class DevicesPage extends OpenClawLightDomElement {
           dismissHint: t("devices.inventory.rotateDismissHint"),
         })
       : showSecretRevealDialog({
-          title: t("devices.inventory.rotateWithheldTitle", { role }),
-          message: t("devices.inventory.rotateWithheldBody"),
+          title: t("devices.inventory.rotateWithheldTitle"),
+          // Outcome, then what happens without the operator, then the one case that
+          // needs them. The protocol reason is the muted last line, not the lead.
+          message: [
+            t("devices.inventory.rotateWithheldOutcome", { device: device.name, role }),
+            t("devices.inventory.rotateWithheldNext"),
+            t("devices.inventory.rotateWithheldException"),
+          ],
           acknowledgeLabel: t("common.close"),
+          note: t("devices.inventory.rotateWithheldNote"),
         }));
   }
 
@@ -509,8 +520,8 @@ class DevicesPage extends OpenClawLightDomElement {
               void this.confirmInventoryRemoval({ kind: "stale", entries });
             }
           },
-          onDeviceRotate: (deviceId, role, scopes) =>
-            void this.reportRotationOutcome(deviceId, role, scopes),
+          onDeviceRotate: (device, role, scopes) =>
+            void this.reportRotationOutcome(device, role, scopes),
           onDeviceRevoke: (deviceId, role) => void this.confirmTokenRevoke(deviceId, role),
           onLoadConfig: () =>
             void this.context.runtimeConfig.refresh({ discardPendingChanges: true }),

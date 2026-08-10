@@ -8,13 +8,17 @@ import "./modal-dialog.ts";
 
 type SecretRevealDialogOptions = {
   title: string;
-  message: string;
+  /** One paragraph per element, so an outcome can lead and its exception stay separate
+   *  instead of collapsing into a wall of clauses. */
+  message: string | string[];
   /** Omitted when the operation issued no secret to this operator; the dialog then
    *  reports the outcome only, and dismissal gestures behave normally. */
   secret?: string;
   acknowledgeLabel: string;
   /** Only reachable with a secret, because only then is dismissal refused. */
   dismissHint?: string;
+  /** Muted trailing rationale. Never the answer to "what do I do now?"; that leads. */
+  note?: string;
 };
 
 /**
@@ -47,19 +51,24 @@ export function showSecretRevealDialog(options: SecretRevealDialogOptions): Prom
       dismissRefused = true;
       paint();
     };
+    const paragraphs = Array.isArray(options.message) ? options.message : [options.message];
     const paint = () => {
       render(
         html`
           <openclaw-modal-dialog
             label=${options.title}
-            description=${options.message}
+            description=${paragraphs.join(" ")}
             @modal-cancel=${handleCancel}
           >
             <div class="exec-approval-card">
               <div class="exec-approval-header">
                 <div>
                   <div class="exec-approval-title">${options.title}</div>
-                  <div class="exec-approval-sub">${options.message}</div>
+                  <div class="secret-reveal__body">
+                    ${paragraphs.map(
+                      (paragraph) => html`<div class="exec-approval-sub">${paragraph}</div>`,
+                    )}
+                  </div>
                 </div>
               </div>
               ${options.secret
@@ -73,6 +82,7 @@ export function showSecretRevealDialog(options: SecretRevealDialogOptions): Prom
               ${dismissRefused
                 ? html`<p class="secret-reveal__hint" role="status">${options.dismissHint}</p>`
                 : nothing}
+              ${options.note ? html`<p class="secret-reveal__note">${options.note}</p>` : nothing}
               <div class="exec-approval-actions">
                 <button type="button" class="btn primary" autofocus @click=${acknowledge}>
                   ${options.acknowledgeLabel}

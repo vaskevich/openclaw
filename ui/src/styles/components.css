@@ -3257,6 +3257,20 @@ td.data-table-key-col {
   font-size: 12px;
 }
 
+/* Separate the outcome, the next step, and the exception; run together they read as
+   one block and the reader stops before reaching the part that needs them. */
+.secret-reveal__body {
+  display: grid;
+  gap: 6px;
+}
+
+/* Trailing rationale: readable, but never competing with the outcome above it. */
+.secret-reveal__note {
+  margin: 10px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+}
+
 /* ===========================================
    Agents
    =========================================== */
