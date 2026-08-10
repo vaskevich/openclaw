@@ -10,6 +10,8 @@ import { Type } from "typebox";
 import { toErrorObject } from "../../../infra/errors.js";
 import { formatDurationSeconds } from "../../../infra/format-time/format-duration.js";
 import { releaseChildProcessOutputAfterExit } from "../../../process/child-process.js";
+import { COMMAND_PROCESS_TREE_KILL_GRACE_MS } from "../../../process/exec-spawn.js";
+import { createCommandTerminationController } from "../../../process/exec-termination.js";
 import { spawnCommand } from "../../../process/exec.js";
 import { keyHint } from "../../modes/interactive/components/keybinding-hints.js";
 import { truncateToVisualLines } from "../../modes/interactive/components/visual-truncate.js";
@@ -19,7 +21,6 @@ import {
   buildShellCommandInvocation,
   getBashShellConfig,
   getBashShellEnv,
-  killProcessTree,
 } from "../../shell-utils.js";
 import type { ToolDefinition, ToolRenderResultOptions } from "../extensions/types.js";
 import type { BashOperations } from "./bash-operations.js";
@@ -71,26 +72,53 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
           );
           return;
         }
+        const cancelController = new AbortController();
+        const shellEnv = env ?? getBashShellEnv(shellConfig.shell);
         const child = spawnCommand(invocation.argv, {
           baseEnv: {},
           buffer: false,
+          cancelSignal: cancelController.signal,
           cwd,
           detached: process.platform !== "win32",
-          env: env ?? getBashShellEnv(shellConfig.shell),
+          env: shellEnv,
+          forceKillAfterDelay: COMMAND_PROCESS_TREE_KILL_GRACE_MS,
           ...(invocation.input === undefined ? {} : { input: invocation.input }),
           reject: false,
           stdio: [invocation.stdin, "pipe", "pipe"],
         });
         const releaseOutput = releaseChildProcessOutputAfterExit(child.nodeChildProcess);
+        let childExited = false;
+        let commandSettled = false;
+        child.nodeChildProcess.once("exit", () => {
+          childExited = true;
+        });
+        const terminationController = createCommandTerminationController({
+          child: child.nodeChildProcess,
+          cancelController,
+          baseEnv: {},
+          env: shellEnv,
+          processTree: { mode: "force" },
+          isChildExited: () => childExited,
+          isCommandSettled: () => commandSettled,
+        });
         let timedOut = false;
+        let terminationStarted = false;
         let timeoutHandle: NodeJS.Timeout | undefined;
+        const terminate = () => {
+          if (terminationStarted) {
+            return;
+          }
+          terminationStarted = true;
+          const abortDeferred = terminationController.terminate();
+          if (!abortDeferred) {
+            cancelController.abort();
+          }
+        };
         const timeoutMs = resolveBashTimeoutMs(timeout);
         if (timeoutMs !== undefined) {
           timeoutHandle = setTimeout(() => {
             timedOut = true;
-            if (child.pid) {
-              killProcessTree(child.pid, { detached: true });
-            }
+            terminate();
           }, timeoutMs);
         }
         // Stream stdout and stderr. Tag each pipe so downstream decode state
@@ -98,11 +126,7 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
         child.stdout?.on("data", (data: Buffer) => onData(data, "stdout"));
         child.stderr?.on("data", (data: Buffer) => onData(data, "stderr"));
         // Handle abort signal by killing the entire process tree.
-        const onAbort = () => {
-          if (child.pid) {
-            killProcessTree(child.pid, { detached: true });
-          }
-        };
+        const onAbort = () => terminate();
         if (signal) {
           if (signal.aborted) {
             onAbort();
@@ -111,6 +135,10 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
           }
         }
         void child
+          .then((result) => {
+            commandSettled = true;
+            return terminationController.settle().then(() => result);
+          })
           .then((result) => {
             if (result.failed && result.exitCode === undefined && result.signal === undefined) {
               if (result instanceof Error) {
@@ -134,7 +162,9 @@ export function createLocalBashOperations(options?: { shellPath?: string }): Bas
             }
             resolve({ exitCode: result.exitCode ?? (result.failed ? 1 : 0) });
           })
-          .catch((err: unknown) => {
+          .catch(async (err: unknown) => {
+            commandSettled = true;
+            await terminationController.settle();
             if (timeoutHandle) {
               clearTimeout(timeoutHandle);
             }

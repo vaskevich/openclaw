@@ -12,12 +12,14 @@ type TerminationChild = {
   kill(signal?: NodeJS.Signals | number): boolean;
 };
 
+type ProcessTreeTermination = { mode: "graceful"; graceMs?: number } | { mode: "force" };
+
 export function createCommandTerminationController(params: {
   child: TerminationChild;
   cancelController: AbortController;
   baseEnv?: NodeJS.ProcessEnv;
   env?: NodeJS.ProcessEnv;
-  killProcessTree?: boolean;
+  processTree?: ProcessTreeTermination;
   isChildExited: () => boolean;
   isCommandSettled: () => boolean;
 }): { terminate: () => boolean; settle: () => Promise<void> } {
@@ -58,7 +60,7 @@ export function createCommandTerminationController(params: {
       return undefined;
     }
   };
-  const startWindowsTermination = (childPid: number, graceful: boolean): void => {
+  const startWindowsTermination = (childPid: number, graceful: boolean, graceMs: number): void => {
     const taskkills: Promise<unknown>[] = [];
     const startTaskkill = (args: string[]) => {
       const taskkill = spawnTaskkillOrFallback(args, killDirectChild);
@@ -70,7 +72,7 @@ export function createCommandTerminationController(params: {
       if (graceful) {
         startTaskkill(["/PID", String(childPid), "/T"]);
         await new Promise<void>((resolve) => {
-          const timer = setTimeout(resolve, COMMAND_PROCESS_TREE_KILL_GRACE_MS);
+          const timer = setTimeout(resolve, graceMs);
           timer.unref();
         });
         if (isDirectChildAlive()) {
@@ -96,14 +98,21 @@ export function createCommandTerminationController(params: {
       // target an unrelated tree; stronger ownership requires a spawn-time Job Object.
       return false;
     }
-    if (params.killProcessTree && typeof childPid === "number") {
-      processTreeSettleAt ??= Date.now() + COMMAND_PROCESS_TREE_KILL_GRACE_MS;
+    if (params.processTree && typeof childPid === "number") {
+      const force = params.processTree.mode === "force";
+      const graceMs =
+        params.processTree.mode === "graceful"
+          ? (params.processTree.graceMs ?? COMMAND_PROCESS_TREE_KILL_GRACE_MS)
+          : 0;
+      if (!force) {
+        processTreeSettleAt ??= Date.now() + graceMs;
+      }
       if (process.platform === "win32") {
-        startWindowsTermination(childPid, true);
+        startWindowsTermination(childPid, !force, graceMs);
         return true;
       }
       terminateProcessTree(childPid, {
-        graceMs: COMMAND_PROCESS_TREE_KILL_GRACE_MS,
+        ...(force ? { force: true } : { graceMs }),
         detached: true,
       });
       return false;
@@ -112,7 +121,7 @@ export function createCommandTerminationController(params: {
       return false;
     }
     if (process.platform === "win32" && typeof childPid === "number") {
-      startWindowsTermination(childPid, false);
+      startWindowsTermination(childPid, false, 0);
       return true;
     }
     return false;
@@ -123,7 +132,7 @@ export function createCommandTerminationController(params: {
       await windowsTerminationPromise;
     }
     if (
-      !params.killProcessTree ||
+      params.processTree?.mode !== "graceful" ||
       processTreeSettleAt === undefined ||
       typeof params.child.pid !== "number"
     ) {
