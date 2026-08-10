@@ -1078,6 +1078,8 @@ async function runOperatorInstallPolicy(params: {
     } else {
       logPolicyResult(reevaluated);
     }
+    // Approval covers this warning only after a fresh evaluation. Callers that
+    // offer one-shot approval still reject warnings from later scan stages.
     return undefined;
   }
   return {
