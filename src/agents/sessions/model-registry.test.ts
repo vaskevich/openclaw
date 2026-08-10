@@ -231,7 +231,7 @@ describe("ModelRegistry models.json auth", () => {
     expect(first.find("custom", "example-model")).toBeDefined();
   });
 
-  it("preserves models.json provider auth in a catalog fork", async () => {
+  it("ignores models.json provider auth and uses canonical stored auth in a catalog fork", async () => {
     const modelsPath = writeModelsJson({
       providers: {
         custom: {
@@ -243,16 +243,21 @@ describe("ModelRegistry models.json auth", () => {
       },
     });
     const template = ModelRegistry.create(AuthStorage.inMemory(), modelsPath);
-    const fork = template.fork(AuthStorage.inMemory());
-    const model = fork.find("custom", "example-model");
+    const unauthenticatedFork = template.fork(AuthStorage.inMemory());
+    const model = unauthenticatedFork.find("custom", "example-model");
 
     expect(model).toBeDefined();
-    await expect(fork.getApiKeyForProvider("custom")).resolves.toBe("test-token-placeholder");
-    await expect(fork.getApiKeyAndHeaders(model!)).resolves.toEqual({
+    await expect(unauthenticatedFork.getApiKeyForProvider("custom")).resolves.toBeUndefined();
+    await expect(unauthenticatedFork.getApiKeyAndHeaders(model!)).resolves.toEqual({
       ok: true,
-      apiKey: "test-token-placeholder",
+      apiKey: undefined,
       headers: undefined,
     });
+
+    const authenticatedFork = template.fork(
+      AuthStorage.inMemory({ custom: { type: "api_key", key: "canonical-key" } }),
+    );
+    await expect(authenticatedFork.getApiKeyForProvider("custom")).resolves.toBe("canonical-key");
   });
 
   it("does not restore a source provider after unregistering it from a fork", () => {
@@ -325,7 +330,7 @@ describe("ModelRegistry models.json auth", () => {
     expect(registry.getAvailable().map((model) => model.id)).toEqual(["example-model"]);
   });
 
-  it("automatically migrates released provider models before the first registry load", async () => {
+  it("migrates released provider models without using their catalog credential", async () => {
     const modelsPath = writeModelsJson({ providers: {} });
     const agentDir = dirname(modelsPath);
     const catalogPath = join(agentDir, "plugins", "zai", PLUGIN_MODEL_CATALOG_FILE);
@@ -349,9 +354,7 @@ describe("ModelRegistry models.json auth", () => {
 
     expect(registry.getError()).toBeUndefined();
     expect(registry.find("zai", "glm-5.1")?.name).toBe("GLM 5.1");
-    await expect(registry.getApiKeyForProvider("zai")).resolves.toBe(
-      "released-zai-provider-test-key",
-    );
+    await expect(registry.getApiKeyForProvider("zai")).resolves.toBeUndefined();
     expect(listPersistedPluginModelCatalogs(agentDir)).toEqual([{ pluginId: "zai", contents }]);
     expect(existsSync(catalogPath)).toBe(false);
   });

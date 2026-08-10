@@ -575,7 +575,10 @@ export class ModelRegistry {
 
       for (const [providerName, providerConfig] of Object.entries(configForUse.providers)) {
         if ((providerConfig.models ?? []).length > 0) {
-          this.storeProviderRequestConfig(providerName, providerConfig);
+          // Catalog credentials are migration input, never request auth. Runtime
+          // authentication comes only from the canonical credential store.
+          const { apiKey: _catalogApiKey, ...requestConfig } = providerConfig;
+          this.storeProviderRequestConfig(providerName, requestConfig);
         }
       }
 

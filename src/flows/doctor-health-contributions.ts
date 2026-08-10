@@ -82,6 +82,15 @@ async function runAuthProfileHealth(ctx: DoctorHealthFlowContext): Promise<void>
     prompter: ctx.prompter,
     runtime: ctx.runtime,
   });
+  const { maybeMigrateModelCatalogCredentials } =
+    await import("../commands/doctor-model-catalog-credentials.js");
+  const catalogCredentialMigration = await maybeMigrateModelCatalogCredentials({
+    cfg: ctx.cfg,
+    ...(ctx.env ? { env: ctx.env } : {}),
+    prompter: ctx.prompter,
+    runtime: ctx.runtime,
+  });
+  ctx.cfg = catalogCredentialMigration.config;
   ctx.cfg = await maybeRepairLegacyOAuthProfileIds(ctx.cfg, ctx.prompter);
   await noteAuthProfileHealth({
     cfg: ctx.cfg,

@@ -437,7 +437,7 @@ describe("models-config", () => {
         {
           cfg: { models: { providers: {} } },
           agentDir: "/tmp/openclaw-models-config-policy-registry-test",
-          env: {},
+          env: { POLICY_ALIAS_API_KEY: "policy-test-secret" },
           existingRaw: "",
           existingParsed: null,
           pluginMetadataSnapshot,
@@ -510,7 +510,10 @@ describe("models-config", () => {
       {
         cfg: { models: { providers: {} } },
         agentDir: "/tmp/openclaw-models-config-env-vars-test",
-        env: { ZAI_API_KEY: "sk-test" } as NodeJS.ProcessEnv,
+        env: {
+          ZAI_API_KEY: "sk-test",
+          CUSTOM_API_KEY: "custom-test-secret",
+        } as NodeJS.ProcessEnv,
         existingRaw: "",
         existingParsed: null,
         pluginMetadataSnapshot,
@@ -543,6 +546,81 @@ describe("models-config", () => {
       providers?: Record<string, unknown>;
     };
     expect(Object.keys(zaiCatalog.providers ?? {})).toEqual(["zai"]);
+  });
+
+  it("never serializes plaintext profile credentials into root or plugin catalogs", async () => {
+    const agentDir = "/tmp/openclaw-models-config-profile-persistence-test";
+    replaceRuntimeAuthProfileStoreSnapshots([
+      {
+        agentDir,
+        store: {
+          version: 1,
+          profiles: {
+            "custom:default": {
+              type: "api_key",
+              provider: "custom",
+              key: "custom-profile-secret",
+            },
+            "zai:default": {
+              type: "api_key",
+              provider: "zai",
+              key: "zai-profile-secret",
+            },
+          },
+        },
+      },
+    ]);
+    const pluginMetadataSnapshot = {
+      index: { plugins: [{ pluginId: "zai", enabled: true }] },
+      normalizePluginId: (pluginId: string) => pluginId,
+      manifestRegistry: { plugins: [], diagnostics: [] },
+      owners: {
+        providers: new Map([["zai", ["zai"]]]),
+        modelCatalogProviders: new Map([["zai", ["zai"]]]),
+        setupProviders: new Map(),
+      },
+    } as unknown as Pick<PluginMetadataSnapshot, "index" | "manifestRegistry" | "owners">;
+
+    try {
+      const plan = await planOpenClawModelsJsonWithDeps(
+        {
+          cfg: { models: { providers: {} } },
+          agentDir,
+          env: {},
+          existingRaw: "",
+          existingParsed: null,
+          pluginMetadataSnapshot,
+        },
+        {
+          resolveImplicitProviders: async () => ({
+            custom: createImplicitOpenAiProvider({
+              baseUrl: "https://custom.example/v1",
+              apiKey: "custom-profile-secret",
+            }),
+            zai: createImplicitOpenAiProvider({
+              baseUrl: "https://api.z.ai/api/paas/v4",
+              apiKey: "zai-profile-secret",
+            }),
+          }),
+        },
+      );
+
+      expect(plan.action).toBe("write");
+      if (plan.action !== "write") {
+        throw new Error("Expected models.json write plan");
+      }
+      const root = JSON.parse(plan.contents) as {
+        providers?: Record<string, { apiKey?: string }>;
+      };
+      const pluginPath = encodePluginModelCatalogRelativePath("zai");
+      const plugin = JSON.parse(plan.pluginCatalogWrites?.[pluginPath] ?? "{}") as {
+        providers?: Record<string, { apiKey?: string }>;
+      };
+      expect(root.providers?.custom?.apiKey).toBe("custom:default");
+      expect(plugin.providers?.zai?.apiKey).toBe("zai:default");
+    } finally {
+      clearRuntimeAuthProfileStoreSnapshots();
+    }
   });
 
   it("falls back to canonical env markers when provider runtime has no api-key policy", async () => {

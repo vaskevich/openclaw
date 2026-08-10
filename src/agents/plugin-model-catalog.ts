@@ -13,7 +13,10 @@ import { createSubsystemLogger } from "../logging/subsystem.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../state/openclaw-agent-db-readonly.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../state/openclaw-agent-db.generated.js";
-import { runOpenClawAgentWriteTransaction } from "../state/openclaw-agent-db.js";
+import {
+  runOpenClawAgentWriteTransaction,
+  type OpenClawAgentDatabase,
+} from "../state/openclaw-agent-db.js";
 import {
   resolveAuthProfileDatabaseOwnerId,
   resolveAuthProfileDatabasePath,
@@ -167,6 +170,7 @@ function readPersistedPluginModelCatalogMigrationPayloads(
 
 function replacePersistedPluginModelCatalogEntries(params: {
   agentDir: string;
+  database?: OpenClawAgentDatabase;
   planned: ReadonlyMap<string, string>;
   migrationPayloads?: ReadonlyMap<string, string>;
   deleteMissing?: boolean;
@@ -179,83 +183,87 @@ function replacePersistedPluginModelCatalogEntries(params: {
     return false;
   }
   const updatedAt = Date.now();
-  return runOpenClawAgentWriteTransaction(
-    (database) => {
-      const kysely = getNodeSqliteKysely<PluginModelCatalogDatabase>(database.db);
-      const existing = executeSqliteQuerySync(
+  const replace = (database: OpenClawAgentDatabase) => {
+    const kysely = getNodeSqliteKysely<PluginModelCatalogDatabase>(database.db);
+    const existing = executeSqliteQuerySync(
+      database.db,
+      kysely
+        .selectFrom("cache_entries")
+        .select(["key", "value_json"])
+        .where("scope", "=", PLUGIN_MODEL_CATALOG_CACHE_SCOPE),
+    ).rows;
+    const existingByPluginId = new Map(existing.map((row) => [row.key, row.value_json]));
+    const existingMigrationPayloads = params.migrationPayloads
+      ? new Map(
+          executeSqliteQuerySync(
+            database.db,
+            kysely
+              .selectFrom("cache_entries")
+              .select(["key", "value_json"])
+              .where("scope", "=", PLUGIN_MODEL_CATALOG_MIGRATION_SCOPE),
+          ).rows.map((row) => [row.key, row.value_json]),
+        )
+      : undefined;
+    const upsertCacheEntry = (scope: string, pluginId: string, contents: string): void => {
+      executeSqliteQuerySync(
         database.db,
         kysely
-          .selectFrom("cache_entries")
-          .select(["key", "value_json"])
-          .where("scope", "=", PLUGIN_MODEL_CATALOG_CACHE_SCOPE),
-      ).rows;
-      const existingByPluginId = new Map(existing.map((row) => [row.key, row.value_json]));
-      const existingMigrationPayloads = params.migrationPayloads
-        ? new Map(
-            executeSqliteQuerySync(
-              database.db,
-              kysely
-                .selectFrom("cache_entries")
-                .select(["key", "value_json"])
-                .where("scope", "=", PLUGIN_MODEL_CATALOG_MIGRATION_SCOPE),
-            ).rows.map((row) => [row.key, row.value_json]),
-          )
-        : undefined;
-      const upsertCacheEntry = (scope: string, pluginId: string, contents: string): void => {
-        executeSqliteQuerySync(
-          database.db,
-          kysely
-            .insertInto("cache_entries")
-            .values({
-              scope,
-              key: pluginId,
+          .insertInto("cache_entries")
+          .values({
+            scope,
+            key: pluginId,
+            value_json: contents,
+            blob: null,
+            expires_at: null,
+            updated_at: updatedAt,
+          })
+          .onConflict((conflict) =>
+            conflict.columns(["scope", "key"]).doUpdateSet({
               value_json: contents,
               blob: null,
               expires_at: null,
               updated_at: updatedAt,
-            })
-            .onConflict((conflict) =>
-              conflict.columns(["scope", "key"]).doUpdateSet({
-                value_json: contents,
-                blob: null,
-                expires_at: null,
-                updated_at: updatedAt,
-              }),
-            ),
-        );
-      };
-      let changed = false;
-      for (const [pluginId, contents] of params.planned) {
-        const migrationPayload = params.migrationPayloads?.get(pluginId);
-        if (migrationPayload && existingMigrationPayloads?.get(pluginId) === migrationPayload) {
+            }),
+          ),
+      );
+    };
+    let changed = false;
+    for (const [pluginId, contents] of params.planned) {
+      const migrationPayload = params.migrationPayloads?.get(pluginId);
+      if (migrationPayload && existingMigrationPayloads?.get(pluginId) === migrationPayload) {
+        continue;
+      }
+      if (existingByPluginId.get(pluginId) !== contents) {
+        upsertCacheEntry(PLUGIN_MODEL_CATALOG_CACHE_SCOPE, pluginId, contents);
+        changed = true;
+      }
+      if (migrationPayload) {
+        upsertCacheEntry(PLUGIN_MODEL_CATALOG_MIGRATION_SCOPE, pluginId, migrationPayload);
+        changed = true;
+      }
+    }
+    if (params.deleteMissing !== false) {
+      for (const pluginId of existingByPluginId.keys()) {
+        if (params.planned.has(pluginId)) {
           continue;
         }
-        if (existingByPluginId.get(pluginId) !== contents) {
-          upsertCacheEntry(PLUGIN_MODEL_CATALOG_CACHE_SCOPE, pluginId, contents);
-          changed = true;
-        }
-        if (migrationPayload) {
-          upsertCacheEntry(PLUGIN_MODEL_CATALOG_MIGRATION_SCOPE, pluginId, migrationPayload);
-          changed = true;
-        }
+        executeSqliteQuerySync(
+          database.db,
+          kysely
+            .deleteFrom("cache_entries")
+            .where("scope", "=", PLUGIN_MODEL_CATALOG_CACHE_SCOPE)
+            .where("key", "=", pluginId),
+        );
+        changed = true;
       }
-      if (params.deleteMissing !== false) {
-        for (const pluginId of existingByPluginId.keys()) {
-          if (params.planned.has(pluginId)) {
-            continue;
-          }
-          executeSqliteQuerySync(
-            database.db,
-            kysely
-              .deleteFrom("cache_entries")
-              .where("scope", "=", PLUGIN_MODEL_CATALOG_CACHE_SCOPE)
-              .where("key", "=", pluginId),
-          );
-          changed = true;
-        }
-      }
-      return changed;
-    },
+    }
+    return changed;
+  };
+  if (params.database) {
+    return replace(params.database);
+  }
+  return runOpenClawAgentWriteTransaction(
+    replace,
     pluginModelCatalogDatabaseOptions(params.agentDir),
     {
       operationLabel:
@@ -641,6 +649,7 @@ export function loadPersistedPluginModelCatalogs(
 /** Replaces rebuildable provider catalogs in the existing per-agent SQLite cache. */
 export function replacePersistedPluginModelCatalogs(params: {
   agentDir: string;
+  database?: OpenClawAgentDatabase;
   pluginCatalogWrites: Readonly<Record<string, string>>;
 }): boolean {
   const planned = new Map<string, string>();
@@ -651,7 +660,11 @@ export function replacePersistedPluginModelCatalogs(params: {
     }
     planned.set(pluginId, repairPluginModelCatalogTransportMetadata(contents).contents);
   }
-  return replacePersistedPluginModelCatalogEntries({ agentDir: params.agentDir, planned });
+  return replacePersistedPluginModelCatalogEntries({
+    agentDir: params.agentDir,
+    ...(params.database ? { database: params.database } : {}),
+    planned,
+  });
 }
 
 export type PluginModelCatalogMetadataSnapshot = Pick<PluginMetadataSnapshot, "owners"> & {
