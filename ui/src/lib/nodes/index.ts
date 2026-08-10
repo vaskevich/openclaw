@@ -405,11 +405,20 @@ export async function rejectNodePairingRequest(state: InventoryState, requestId:
   }
 }
 
-/** Returns the rotated token for the owning page to reveal; the Gateway never resends it. */
+/**
+ * How a rotation ended, for the owning page to report. The Gateway echoes the bearer
+ * token only to a device rotating its own token, so a cross-device rotation is a real
+ * outcome with no secret to show rather than a failure.
+ */
+type RotatedDeviceTokenOutcome =
+  | { delivery: "in-band"; token: string }
+  | { delivery: "withheld-cross-device" };
+
+/** Rotates a device token and returns what the Gateway did with the replacement. */
 export async function rotateDeviceToken(
   state: DevicesState,
   params: { deviceId: string; gatewayUrl: string; role: string; scopes?: string[] },
-): Promise<string | null> {
+): Promise<RotatedDeviceTokenOutcome | null> {
   const client = state.client;
   if (!client || !state.connected) {
     return null;
@@ -422,18 +431,23 @@ export async function rotateDeviceToken(
       role?: string;
       deviceId?: string;
       scopes?: Array<string>;
+      tokenDelivery?: string;
     }>("device.token.rotate", requestParams);
-    const token = res?.token ?? null;
+    const token = res?.token;
+    // Gateways that predate tokenDelivery leave the present token as the only signal.
+    const withheld = res?.tokenDelivery === undefined ? !token : res.tokenDelivery !== "in-band";
+    const outcome: RotatedDeviceTokenOutcome =
+      withheld || !token ? { delivery: "withheld-cross-device" } : { delivery: "in-band", token };
     // A retired epoch stops every state write below, but never the return: the previous
     // credential is already dead on the server, so discarding this response would leave
     // the operator locked out with no way to ask for the replacement again.
     if (!isCurrentNodesRequest(state, client, generation)) {
-      return token;
+      return outcome;
     }
     if (token) {
       const identity = await loadOrCreateDeviceIdentity();
       if (!isCurrentNodesRequest(state, client, generation)) {
-        return token;
+        return outcome;
       }
       const role = res.role ?? params.role;
       if (res.deviceId === identity.deviceId || params.deviceId === identity.deviceId) {
@@ -447,7 +461,7 @@ export async function rotateDeviceToken(
       }
     }
     await loadDevices(state);
-    return token;
+    return outcome;
   } catch (err) {
     if (isCurrentNodesRequest(state, client, generation)) {
       state.devicesError = String(err);

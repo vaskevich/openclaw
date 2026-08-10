@@ -38,6 +38,22 @@ export const DeviceTokenRotateParamsSchema = closedObject({
   scopes: Type.Optional(Type.Array(NonEmptyString)),
 });
 
+/**
+ * Rotation outcome. `tokenDelivery` records how the replacement reached its owner so
+ * clients report a fact instead of inferring one from the absent `token`: the gateway
+ * echoes the bearer token only to a device rotating its own token, and never on a
+ * shared/admin cross-device rotation (see `docs/cli/devices.md`). Optional because
+ * gateways released before this field omit it entirely.
+ */
+export const DeviceTokenRotateResultSchema = closedObject({
+  deviceId: NonEmptyString,
+  role: NonEmptyString,
+  token: Type.Optional(NonEmptyString),
+  scopes: Type.Array(NonEmptyString),
+  rotatedAtMs: Type.Integer({ minimum: 0 }),
+  tokenDelivery: Type.Optional(Type.String({ enum: ["in-band", "withheld-cross-device"] })),
+});
+
 /** Revokes one role-bound device token grant. */
 export const DeviceTokenRevokeParamsSchema = closedObject({
   deviceId: NonEmptyString,
@@ -125,4 +141,5 @@ export type DevicePairSetupCodeParams = Static<typeof DevicePairSetupCodeParamsS
 export type DevicePairSetupCodeResult = Static<typeof DevicePairSetupCodeResultSchema>;
 export type DevicePairRenameParams = Static<typeof DevicePairRenameParamsSchema>;
 export type DeviceTokenRotateParams = Static<typeof DeviceTokenRotateParamsSchema>;
+export type DeviceTokenRotateResult = Static<typeof DeviceTokenRotateResultSchema>;
 export type DeviceTokenRevokeParams = Static<typeof DeviceTokenRevokeParamsSchema>;

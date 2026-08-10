@@ -9,12 +9,18 @@ import "./modal-dialog.ts";
 type SecretRevealDialogOptions = {
   title: string;
   message: string;
-  secret: string;
+  /** Omitted when the operation issued no secret to this operator; the dialog then
+   *  reports the outcome only, and dismissal gestures behave normally. */
+  secret?: string;
   acknowledgeLabel: string;
-  dismissHint: string;
+  /** Only reachable with a secret, because only then is dismissal refused. */
+  dismissHint?: string;
 };
 
-/** Resolves only on the explicit acknowledgement; Escape and backdrop cannot settle it. */
+/**
+ * Resolves on the explicit acknowledgement. With a secret, Escape and backdrop cannot
+ * settle it; without one there is nothing to lose, so they close it like any dialog.
+ */
 export function showSecretRevealDialog(options: SecretRevealDialogOptions): Promise<void> {
   const host = document.createElement("div");
   document.body.append(host);
@@ -28,7 +34,12 @@ export function showSecretRevealDialog(options: SecretRevealDialogOptions): Prom
     // The secret is shown once, so a stray Escape or backdrop click must not be the last
     // thing that happens to it. Web Awesome pulses the refused dialog; the hint is the
     // accessible half of that answer, because a silent no-op reads as a broken control.
-    const refuseDismiss = (event: Event) => {
+    // An outcome-only dialog holds nothing recoverable, so it dismisses normally.
+    const handleCancel = (event: Event) => {
+      if (!options.secret) {
+        acknowledge();
+        return;
+      }
       event.preventDefault();
       if (dismissRefused) {
         return;
@@ -42,7 +53,7 @@ export function showSecretRevealDialog(options: SecretRevealDialogOptions): Prom
           <openclaw-modal-dialog
             label=${options.title}
             description=${options.message}
-            @modal-cancel=${refuseDismiss}
+            @modal-cancel=${handleCancel}
           >
             <div class="exec-approval-card">
               <div class="exec-approval-header">
@@ -51,10 +62,14 @@ export function showSecretRevealDialog(options: SecretRevealDialogOptions): Prom
                   <div class="exec-approval-sub">${options.message}</div>
                 </div>
               </div>
-              <div class="secret-reveal__value">
-                <code class="secret-reveal__code">${options.secret}</code>
-                ${renderCopyButton(options.secret, t("common.copy"))}
-              </div>
+              ${options.secret
+                ? html`
+                    <div class="secret-reveal__value">
+                      <code class="secret-reveal__code">${options.secret}</code>
+                      ${renderCopyButton(options.secret, t("common.copy"))}
+                    </div>
+                  `
+                : nothing}
               ${dismissRefused
                 ? html`<p class="secret-reveal__hint" role="status">${options.dismissHint}</p>`
                 : nothing}

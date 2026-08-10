@@ -417,11 +417,12 @@ class DevicesPage extends OpenClawLightDomElement {
     );
   }
 
-  // The rotate response carries the only copy of the new credential, so the reveal is
-  // deliberately outside pendingConfirmation: a reconnect aborts pending confirmations,
-  // and aborting this one would destroy a secret the Gateway cannot reissue.
-  private async revealRotatedToken(deviceId: string, role: string, scopes?: string[]) {
-    const token = await this.runPageTask((pageState) =>
+  // A rotation always ends in a dialog: with the replacement when the Gateway issued it
+  // to this operator, otherwise with what it did instead. The reveal sits deliberately
+  // outside pendingConfirmation, which a reconnect aborts — aborting a shown secret
+  // would destroy the only copy the Gateway can hand out.
+  private async reportRotationOutcome(deviceId: string, role: string, scopes?: string[]) {
+    const outcome = await this.runPageTask((pageState) =>
       rotateDeviceToken(pageState, {
         deviceId,
         gatewayUrl: this.context.gateway.connection.gatewayUrl,
@@ -429,16 +430,22 @@ class DevicesPage extends OpenClawLightDomElement {
         scopes,
       }),
     );
-    if (!token) {
+    if (!outcome) {
       return;
     }
-    await showSecretRevealDialog({
-      title: t("devices.inventory.rotatePromptTitle", { role }),
-      message: t("devices.inventory.rotatePromptBody"),
-      secret: token,
-      acknowledgeLabel: t("devices.inventory.rotateAcknowledge"),
-      dismissHint: t("devices.inventory.rotateDismissHint"),
-    });
+    await (outcome.delivery === "in-band"
+      ? showSecretRevealDialog({
+          title: t("devices.inventory.rotatePromptTitle", { role }),
+          message: t("devices.inventory.rotatePromptBody"),
+          secret: outcome.token,
+          acknowledgeLabel: t("devices.inventory.rotateAcknowledge"),
+          dismissHint: t("devices.inventory.rotateDismissHint"),
+        })
+      : showSecretRevealDialog({
+          title: t("devices.inventory.rotateWithheldTitle", { role }),
+          message: t("devices.inventory.rotateWithheldBody"),
+          acknowledgeLabel: t("common.close"),
+        }));
   }
 
   private resolveExecApprovalsTarget(): ExecApprovalsTarget {
@@ -503,7 +510,7 @@ class DevicesPage extends OpenClawLightDomElement {
             }
           },
           onDeviceRotate: (deviceId, role, scopes) =>
-            void this.revealRotatedToken(deviceId, role, scopes),
+            void this.reportRotationOutcome(deviceId, role, scopes),
           onDeviceRevoke: (deviceId, role) => void this.confirmTokenRevoke(deviceId, role),
           onLoadConfig: () =>
             void this.context.runtimeConfig.refresh({ discardPendingChanges: true }),

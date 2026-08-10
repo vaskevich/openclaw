@@ -86,24 +86,56 @@ describe("device token request lifecycle", () => {
 
     const operation = rotateDeviceToken(state, tokenParams);
     state.requestGeneration += 1;
-    response.resolve({ token: "rotated-token", ...tokenParams });
+    response.resolve({ token: "rotated-token", tokenDelivery: "in-band", ...tokenParams });
 
-    expect(await operation).toBe("rotated-token");
+    expect(await operation).toEqual({ delivery: "in-band", token: "rotated-token" });
     expect(loadDeviceAuthToken(tokenParams)).toBeNull();
   });
 
   it("rechecks rotate ownership after loading the local identity", async () => {
     storeIdentity();
     const { digest, digestMock } = deferIdentityFingerprint();
-    const state = createState(async () => ({ token: "rotated-token", ...tokenParams }));
+    const state = createState(async () => ({
+      token: "rotated-token",
+      tokenDelivery: "in-band",
+      ...tokenParams,
+    }));
 
     const operation = rotateDeviceToken(state, tokenParams);
     await vi.waitFor(() => expect(digestMock).toHaveBeenCalledOnce());
     state.requestGeneration += 1;
     digest.resolve(new Uint8Array([0]).buffer);
 
-    expect(await operation).toBe("rotated-token");
+    expect(await operation).toEqual({ delivery: "in-band", token: "rotated-token" });
     expect(loadDeviceAuthToken(tokenParams)).toBeNull();
+  });
+
+  it("reports a cross-device rotation the Gateway withheld the token for", async () => {
+    const state = createState(async () => ({
+      ...tokenParams,
+      scopes: [],
+      tokenDelivery: "withheld-cross-device",
+    }));
+
+    expect(await rotateDeviceToken(state, tokenParams)).toEqual({
+      delivery: "withheld-cross-device",
+    });
+    expect(loadDeviceAuthToken(tokenParams)).toBeNull();
+  });
+
+  // Gateways released before tokenDelivery answer without it; a present token is then
+  // the only signal, so the outcome must still resolve rather than read as withheld.
+  it("classifies a rotate response from a Gateway that omits tokenDelivery", async () => {
+    storeIdentity();
+    const { digest, digestMock } = deferIdentityFingerprint();
+    const state = createState(async () => ({ token: "legacy-token", ...tokenParams }));
+
+    const operation = rotateDeviceToken(state, tokenParams);
+    await vi.waitFor(() => expect(digestMock).toHaveBeenCalledOnce());
+    state.requestGeneration += 1;
+    digest.resolve(new Uint8Array([0]).buffer);
+
+    expect(await operation).toEqual({ delivery: "in-band", token: "legacy-token" });
   });
 
   it("does not clear a current token when a revoke request retires during identity loading", async () => {

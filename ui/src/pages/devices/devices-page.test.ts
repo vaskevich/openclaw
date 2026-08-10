@@ -43,7 +43,7 @@ type TestDevicesPage = HTMLElement & {
   }) => Promise<void>;
   confirmPairingReject: (target: "device" | "node", requestId: string) => Promise<void>;
   confirmTokenRevoke: (deviceId: string, role: string) => Promise<void>;
-  revealRotatedToken: (deviceId: string, role: string, scopes?: string[]) => Promise<void>;
+  reportRotationOutcome: (deviceId: string, role: string, scopes?: string[]) => Promise<void>;
 };
 
 const ROTATED_TOKEN = "rotated-operator-token";
@@ -62,7 +62,13 @@ function stubLocalDeviceIdentity() {
 function rotatingClient(token: string | null): GatewayBrowserClient {
   const request = vi.fn(async (method: string) =>
     method === "device.token.rotate"
-      ? { deviceId: "device-1", role: "operator", scopes: [], token }
+      ? {
+          deviceId: "device-1",
+          role: "operator",
+          scopes: [],
+          ...(token ? { token } : {}),
+          tokenDelivery: token ? "in-band" : "withheld-cross-device",
+        }
       : { paired: [], pending: [] },
   );
   return { request } as unknown as GatewayBrowserClient;
@@ -387,7 +393,7 @@ describe("DevicesPage gateway lifecycle", () => {
     const page = createConnectedPage(client);
 
     let acknowledged = false;
-    const pending = page.revealRotatedToken("device-1", "operator").then(() => {
+    const pending = page.reportRotationOutcome("device-1", "operator").then(() => {
       acknowledged = true;
     });
     const { dialog } = await waitForRenderedModalDialog(document.body);
@@ -412,7 +418,7 @@ describe("DevicesPage gateway lifecycle", () => {
     const page = createConnectedPage(client);
 
     let acknowledged = false;
-    const pending = page.revealRotatedToken("device-1", "operator").then(() => {
+    const pending = page.reportRotationOutcome("device-1", "operator").then(() => {
       acknowledged = true;
     });
     const { modal, webAwesomeDialog } = await waitForRenderedModalDialog(document.body);
@@ -435,16 +441,16 @@ describe("DevicesPage gateway lifecycle", () => {
 
   it("reveals a rotated token that lands after the request generation moved on", async () => {
     stubLocalDeviceIdentity();
-    const rotated = deferred<{ token: string }>();
+    const rotated = deferred<{ token: string; tokenDelivery: string }>();
     const request = vi.fn(async (method: string) =>
       method === "device.token.rotate" ? rotated.promise : { paired: [], pending: [] },
     );
     const client = { request } as unknown as GatewayBrowserClient;
     const page = createConnectedPage(client);
 
-    const pending = page.revealRotatedToken("device-1", "operator");
+    const pending = page.reportRotationOutcome("device-1", "operator");
     page.pageState.requestGeneration += 1;
-    rotated.resolve({ token: ROTATED_TOKEN });
+    rotated.resolve({ token: ROTATED_TOKEN, tokenDelivery: "in-band" });
     await waitForRenderedModalDialog(document.body);
 
     // The rotate already killed the previous credential, so a mid-flight reconnect must
@@ -457,13 +463,55 @@ describe("DevicesPage gateway lifecycle", () => {
     applyGatewaySnapshot(page, gatewaySnapshot(client, false));
   });
 
+  it("explains a cross-device rotation the Gateway withheld the token for", async () => {
+    stubLocalDeviceIdentity();
+    const client = rotatingClient(null);
+    const page = createConnectedPage(client);
+
+    const pending = page.reportRotationOutcome("device-2", "operator");
+    const { dialog } = await waitForRenderedModalDialog(document.body);
+
+    expect(dialog.getAttribute("aria-label")).toBe(
+      t("devices.inventory.rotateWithheldTitle", { role: "operator" }),
+    );
+    expect(document.body.textContent).toContain(t("devices.inventory.rotateWithheldBody"));
+    // No secret reached this operator, so there is no value block and nothing to copy.
+    expect(document.body.querySelector(".secret-reveal__code")).toBeNull();
+    expect(document.body.querySelector(".chat-copy-btn")).toBeNull();
+
+    clickDialogButton(t("common.close"));
+    await pending;
+
+    expect(document.body.querySelector("openclaw-modal-dialog")).toBeNull();
+    applyGatewaySnapshot(page, gatewaySnapshot(client, false));
+  });
+
+  it("lets a dismissal gesture close the withheld-rotation outcome", async () => {
+    stubLocalDeviceIdentity();
+    const client = rotatingClient(null);
+    const page = createConnectedPage(client);
+
+    const pending = page.reportRotationOutcome("device-2", "operator");
+    const { webAwesomeDialog } = await waitForRenderedModalDialog(document.body);
+
+    // Nothing here is unrecoverable, so Escape and backdrop settle it like any dialog
+    // instead of being refused the way the show-once reveal refuses them.
+    const dismissal = new Event("wa-hide", { bubbles: true, cancelable: true, composed: true });
+    webAwesomeDialog.dispatchEvent(dismissal);
+    await pending;
+
+    expect(dismissal.defaultPrevented).toBe(false);
+    expect(document.body.querySelector("openclaw-modal-dialog")).toBeNull();
+    applyGatewaySnapshot(page, gatewaySnapshot(client, false));
+  });
+
   it("shows no reveal when the rotate request fails", async () => {
     stubLocalDeviceIdentity();
     const request = vi.fn().mockRejectedValue(new Error("rotate refused"));
     const client = { request } as unknown as GatewayBrowserClient;
     const page = createConnectedPage(client);
 
-    await page.revealRotatedToken("device-1", "operator");
+    await page.reportRotationOutcome("device-1", "operator");
 
     expect(document.body.querySelector("openclaw-modal-dialog")).toBeNull();
     expect(page.pageState.devicesError).toContain("rotate refused");
