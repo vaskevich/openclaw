@@ -18,7 +18,6 @@ import {
   resolveCloudWorkerStopAction,
 } from "../../components/cloud-worker-stop.ts";
 import { showConfirmDialog } from "../../components/confirm-dialog.ts";
-import { showInputDialog } from "../../components/input-dialog.ts";
 import { fetchSessionMenuWork } from "../../components/session-menu-work.ts";
 import type {
   SessionMenuAction,
@@ -1071,6 +1070,7 @@ class SessionsPage extends OpenClawLightDomElement {
   }
 
   private async requestNewCategory(sessionKey?: string) {
+    const { showInputDialog } = await import("../../components/input-dialog.ts");
     await showInputDialog({
       title: t("sessionsView.newGroupTitle"),
       label: t("sessionsView.newGroupPrompt"),
@@ -1111,6 +1111,7 @@ class SessionsPage extends OpenClawLightDomElement {
   }
 
   private async renameSession(row: GatewaySessionRow) {
+    const { showInputDialog } = await import("../../components/input-dialog.ts");
     const value = await showInputDialog({
       title: t("sessionsView.renameSessionPrompt"),
       defaultValue: normalizeOptionalString(row.label) ?? "",
