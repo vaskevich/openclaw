@@ -340,6 +340,7 @@ export async function maybeMigrateModelCatalogCredentials(params: {
     try {
       const profileIds = new Map(sharedConfigProfileIds);
       let nextRootContents: string | undefined;
+      let pluginCatalogWrites: Record<string, string> | undefined;
       runAuthProfileWriteTransaction(source.agentDir, (database) => {
         const store = loadPersistedAuthProfileStore(source.agentDir, { database }) ?? emptyStore();
         let added = 0;
@@ -365,7 +366,7 @@ export async function maybeMigrateModelCatalogCredentials(params: {
           }
         }
 
-        const pluginCatalogWrites = Object.fromEntries(
+        pluginCatalogWrites = Object.fromEntries(
           parsedPluginCatalogs.map(({ catalog, parsed }) => [
             encodePluginModelCatalogRelativePath(catalog.pluginId),
             parsed
@@ -373,11 +374,6 @@ export async function maybeMigrateModelCatalogCredentials(params: {
               : catalog.contents,
           ]),
         );
-        replacePersistedPluginModelCatalogs({
-          agentDir: source.agentDir,
-          database,
-          pluginCatalogWrites,
-        });
         if (source.root) {
           nextRootContents = `${JSON.stringify(
             rewriteCatalogCredentials(source.root.parsed, profileIds),
@@ -387,6 +383,12 @@ export async function maybeMigrateModelCatalogCredentials(params: {
         }
         migrated += added;
       });
+      if (pluginCatalogWrites) {
+        replacePersistedPluginModelCatalogs({
+          agentDir: source.agentDir,
+          pluginCatalogWrites,
+        });
+      }
       if (source.root && nextRootContents !== undefined && nextRootContents !== source.root.raw) {
         await privateFileStore(source.agentDir).writeText("models.json", nextRootContents);
       }

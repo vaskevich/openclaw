@@ -13,10 +13,7 @@ import { createSubsystemLogger } from "../logging/subsystem.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.types.js";
 import { withOpenClawAgentDatabaseReadOnly } from "../state/openclaw-agent-db-readonly.js";
 import type { DB as OpenClawAgentKyselyDatabase } from "../state/openclaw-agent-db.generated.js";
-import {
-  runOpenClawAgentWriteTransaction,
-  type OpenClawAgentDatabase,
-} from "../state/openclaw-agent-db.js";
+import { runOpenClawAgentWriteTransaction } from "../state/openclaw-agent-db.js";
 import {
   resolveAuthProfileDatabaseOwnerId,
   resolveAuthProfileDatabasePath,
@@ -170,7 +167,6 @@ function readPersistedPluginModelCatalogMigrationPayloads(
 
 function replacePersistedPluginModelCatalogEntries(params: {
   agentDir: string;
-  database?: OpenClawAgentDatabase;
   planned: ReadonlyMap<string, string>;
   migrationPayloads?: ReadonlyMap<string, string>;
   deleteMissing?: boolean;
@@ -259,9 +255,6 @@ function replacePersistedPluginModelCatalogEntries(params: {
     }
     return changed;
   };
-  if (params.database) {
-    return replace(params.database);
-  }
   return runOpenClawAgentWriteTransaction(
     replace,
     pluginModelCatalogDatabaseOptions(params.agentDir),
@@ -649,7 +642,6 @@ export function loadPersistedPluginModelCatalogs(
 /** Replaces rebuildable provider catalogs in the existing per-agent SQLite cache. */
 export function replacePersistedPluginModelCatalogs(params: {
   agentDir: string;
-  database?: OpenClawAgentDatabase;
   pluginCatalogWrites: Readonly<Record<string, string>>;
 }): boolean {
   const planned = new Map<string, string>();
@@ -660,11 +652,7 @@ export function replacePersistedPluginModelCatalogs(params: {
     }
     planned.set(pluginId, repairPluginModelCatalogTransportMetadata(contents).contents);
   }
-  return replacePersistedPluginModelCatalogEntries({
-    agentDir: params.agentDir,
-    ...(params.database ? { database: params.database } : {}),
-    planned,
-  });
+  return replacePersistedPluginModelCatalogEntries({ agentDir: params.agentDir, planned });
 }
 
 export type PluginModelCatalogMetadataSnapshot = Pick<PluginMetadataSnapshot, "owners"> & {
