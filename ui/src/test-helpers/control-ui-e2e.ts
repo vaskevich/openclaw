@@ -156,6 +156,8 @@ const defaultControlUiFeatureMethods = [
   "config.apply",
   "config.patch",
   "config.set",
+  "device.scopes.requestUpgrade",
+  "device.scopes.waitUpgrade",
   "session.members.add",
   "session.members.list",
   "session.members.remove",
@@ -1387,10 +1389,13 @@ function installControlUiMockGateway(
         : configuredValue;
     }
     switch (method) {
-      case "connect":
+      case "connect": {
+        const auth = isRecord(params) && isRecord(params.auth) ? params.auth : null;
+        const connectedDeviceToken =
+          auth && typeof auth.deviceToken === "string" ? auth.deviceToken : scenario.deviceToken;
         return {
           auth: {
-            ...(deviceAuthMigrationPending ? {} : { deviceToken: scenario.deviceToken }),
+            ...(deviceAuthMigrationPending ? {} : { deviceToken: connectedDeviceToken }),
             role: "operator",
             scopes: scenario.operatorScopes,
           },
@@ -1424,6 +1429,7 @@ function installControlUiMockGateway(
           },
           type: "hello-ok",
         };
+      }
       case "agent.identity.get":
         return {
           agentId: scenario.assistantAgentId,
