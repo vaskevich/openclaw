@@ -1042,6 +1042,7 @@ async function runOperatorInstallPolicy(params: {
     targetName: params.targetName,
     targetType: params.targetType,
     requestMode: params.requestMode,
+    warning: installPolicyWarning,
   });
   if (acknowledged) {
     const reevaluated = await evaluatePolicy();

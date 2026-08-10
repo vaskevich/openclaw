@@ -270,7 +270,6 @@ type ArchiveInstallCall = {
     requestedSpecifier?: string;
     source?: { kind?: string; authority?: string; mutable?: boolean; network?: boolean };
   };
-  onInstallPolicyWarning?: () => Promise<boolean>;
   trustedSourceLinkedOfficialInstall?: boolean;
 };
 

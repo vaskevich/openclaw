@@ -47,6 +47,12 @@ describe("resolveInstallPolicyWarningAcknowledgementCliOptions", () => {
         targetName: "demo\npkg",
         targetType: "plugin",
         requestMode: fixture.requestMode,
+        warning: {
+          targetName: "demo\npkg",
+          targetType: "plugin",
+          requestMode: fixture.requestMode,
+          reason: "Review required",
+        },
       }),
     ).resolves.toBe(true);
 
@@ -66,6 +72,12 @@ describe("resolveInstallPolicyWarningAcknowledgementCliOptions", () => {
         targetName: "demo",
         targetType: "skill",
         requestMode: "install",
+        warning: {
+          targetName: "demo",
+          targetType: "skill",
+          requestMode: "install",
+          reason: "Review required",
+        },
       }),
     ).resolves.toBe(false);
   });
@@ -96,6 +108,12 @@ describe("resolveInstallPolicyWarningAcknowledgementCliOptions", () => {
         targetName: "demo",
         targetType: "plugin",
         requestMode: "install",
+        warning: {
+          targetName: "demo",
+          targetType: "plugin",
+          requestMode: "install",
+          reason: "Review required",
+        },
       }),
     ).resolves.toBe(true);
     expect(promptTextMock).not.toHaveBeenCalled();

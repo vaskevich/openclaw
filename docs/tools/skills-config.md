@@ -184,10 +184,11 @@ then run policy again before continuing. Declined and non-interactive commands
 may use `--acknowledge-install-policy-warning` as explicit approval after review;
 every approved warning is re-evaluated before continuing.
 Gateway `plugins.install` clients receive structured warning details and may
-make one explicit retry with `acknowledgeInstallPolicyWarning: true`. The first
-warning consumes that approval. OpenClaw evaluates that same staged scan again
-before allowing the acknowledged warning to continue. A block from that
-evaluation, or a warning from any later package or dependency scan, stops the
+make one explicit retry with the returned `acknowledgementToken` as
+`installPolicyWarningAcknowledgement`. The Gateway consumes that server-issued
+token once and only for the same install request and resolved artifact. OpenClaw
+re-evaluates the staged source and continues only when the warning is unchanged. A block, a
+changed warning, or a warning from a later package or dependency scan stops the
 request before commit and returns its own details. Other
 Gateway-backed and automatic installs remain blocked on warnings because they
 have no operator-confirmation flow. The deprecated
