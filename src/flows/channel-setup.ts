@@ -653,13 +653,10 @@ export async function setupChannels(
     let resumingDisabledChannel = false;
     if (deferredDisabledHint) {
       if (deferredDisabledHint === "disabled") {
-        const resume =
-          channel === targetedChannel
-            ? true
-            : await prompter.confirm({
-                message: t("wizard.channels.resumeDisabledSetup", { channel }),
-                initialValue: true,
-              });
+        const resume = await prompter.confirm({
+          message: t("wizard.channels.resumeDisabledSetup", { channel }),
+          initialValue: true,
+        });
         if (!resume) {
           return "done";
         }
@@ -678,13 +675,10 @@ export async function setupChannels(
         } as OpenClawConfig;
         resumingDisabledChannel = true;
       } else if (deferredDisabledHint === "plugin disabled") {
-        const resume =
-          channel === targetedChannel
-            ? true
-            : await prompter.confirm({
-                message: t("wizard.channels.resumeDisabledPluginSetup", { channel }),
-                initialValue: true,
-              });
+        const resume = await prompter.confirm({
+          message: t("wizard.channels.resumeDisabledPluginSetup", { channel }),
+          initialValue: true,
+        });
         if (!resume) {
           return "done";
         }

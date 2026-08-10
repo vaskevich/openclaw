@@ -1514,6 +1514,8 @@ describe("setupChannels workspace shadow exclusion", () => {
         select,
       } as never,
       {
+        initialSelection: ["external-chat"],
+        finishAfterInitialSelection: true,
         deferStatusUntilSelection: true,
         skipConfirm: true,
         skipDmPolicyPrompt: true,
@@ -1526,6 +1528,7 @@ describe("setupChannels workspace shadow exclusion", () => {
       initialValue: true,
     });
     expect(setupWizard.configure).not.toHaveBeenCalled();
+    expect(select).not.toHaveBeenCalled();
     expect(next).toEqual({
       channels: {
         "external-chat": { enabled: false, token: "secret" },

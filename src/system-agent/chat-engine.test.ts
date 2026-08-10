@@ -851,14 +851,21 @@ describe("SystemAgentChatEngine", () => {
     const baseConfig = {} as OpenClawConfig;
     mocks.readSetupConfigFileSnapshot.mockResolvedValue(configSnapshot(baseConfig) as never);
     mocks.setupChannels.mockImplementation(
-      async (config: OpenClawConfig, _runtime: unknown, prompter: WizardPrompter) => {
+      async (
+        config: OpenClawConfig,
+        _runtime: unknown,
+        prompter: WizardPrompter,
+        options: { onSelection?: (selection: string[]) => void },
+      ) => {
         await prompter.select({
           message: "Select a channel",
           options: [
             { value: "telegram", label: "Telegram" },
             { value: "discord", label: "Discord" },
+            { value: "__done__", label: "Done" },
           ],
         });
+        options.onSelection?.([]);
         return config;
       },
     );
@@ -876,8 +883,14 @@ describe("SystemAgentChatEngine", () => {
       id: expect.any(String),
       header: "Choose one",
       question: "Select a channel",
-      options: [{ label: "Telegram" }, { label: "Discord" }],
+      options: [{ label: "Telegram" }, { label: "Discord" }, { label: "Done" }],
     });
+    expect(mocks.writeWizardConfigFile).not.toHaveBeenCalled();
+
+    const dismissed = await engine.handle("Done");
+
+    expect(dismissed.text).toContain("Nothing was changed");
+    expect(dismissed.text).not.toContain("is configured");
     expect(mocks.writeWizardConfigFile).not.toHaveBeenCalled();
   });
 

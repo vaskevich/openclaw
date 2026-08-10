@@ -1,4 +1,5 @@
 // OpenClaw chat engine: transport-agnostic conversation over typed operations.
+import { isDeepStrictEqual } from "node:util";
 import type {
   SystemAgentChatQuestion,
   WizardAnswer,
@@ -268,8 +269,9 @@ async function defaultChannelSetupWizardRunner(
   return await runHostedConfigWizard({
     label: "Channel setup",
     beforePersistentApply,
-    run: async ({ baseConfig, runtime }) => ({
-      nextConfig: await setupChannels(baseConfig, runtime, prompter, {
+    run: async ({ baseConfig, runtime }) => {
+      let selection: string[] = [];
+      const nextConfig = await setupChannels(baseConfig, runtime, prompter, {
         initialSelection: [channel],
         finishAfterInitialSelection: true,
         forceAllowFromChannels: [channel],
@@ -280,17 +282,26 @@ async function defaultChannelSetupWizardRunner(
         skipDmPolicyPrompt: true,
         skipConfirm: true,
         beforePersistentEffect: async () => await beforePersistentApply(runtime),
+        onSelection: (selected) => {
+          selection = selected;
+        },
         onPostWriteHook: (hook) => postWriteHooks.collect(hook),
-      }),
-      afterWrite: async (committedConfig) => {
-        await runCollectedChannelOnboardingPostWriteHooks({
-          hooks: postWriteHooks.drain(),
-          cfg: committedConfig,
-          runtime,
-          beforePersistentEffect: async () => await beforePersistentApply(runtime),
-        });
-      },
-    }),
+      });
+      if (selection.length === 0 && isDeepStrictEqual(nextConfig, baseConfig)) {
+        return { keptCurrent: true };
+      }
+      return {
+        nextConfig,
+        afterWrite: async (committedConfig) => {
+          await runCollectedChannelOnboardingPostWriteHooks({
+            hooks: postWriteHooks.drain(),
+            cfg: committedConfig,
+            runtime,
+            beforePersistentEffect: async () => await beforePersistentApply(runtime),
+          });
+        },
+      };
+    },
   });
 }
 
