@@ -1083,6 +1083,7 @@ async function runOperatorInstallPolicy(params: {
   return {
     blocked: {
       code: "security_scan_blocked",
+      installPolicyWarning,
       reason: "Install cancelled: the install policy warning was not approved.",
     },
   };

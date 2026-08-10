@@ -183,8 +183,12 @@ same `install anyway` or `update anyway` copy as suspicious ClawHub releases,
 then run policy again before continuing. Declined and non-interactive commands
 may use `--acknowledge-install-policy-warning` as explicit approval after review;
 every approved warning is re-evaluated before continuing.
-Gateway-backed and automatic installs remain
-blocked on warnings because they have no operator-confirmation flow. The deprecated
+Gateway `plugins.install` clients receive structured warning details and may
+make one explicit retry with `acknowledgeInstallPolicyWarning: true`. The first
+warning consumes that approval and is re-evaluated; a block or later warning
+stops the request before commit and returns its own details. Other
+Gateway-backed and automatic installs remain blocked on warnings because they
+have no operator-confirmation flow. The deprecated
 `--dangerously-force-unsafe-install` flag remains a no-op. A `block`, non-zero
 exit, timeout, malformed JSON, missing field, or unsupported protocol version
 always fails closed.
