@@ -1,4 +1,5 @@
 // Tests plugin command install, listing, and config behavior.
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
 import { handlePluginsCommand } from "./commands-plugins.js";
@@ -23,11 +24,11 @@ vi.mock("../../cli/plugins-command-helpers.js", () => ({
   resolveFileNpmSpecToLocalPath: vi.fn(() => null),
 }));
 
-vi.mock("../../cli/plugins-install-persist.js", () => ({
+vi.mock("../../plugins/install-persistence.js", () => ({
   persistPluginInstall: vi.fn(async () => undefined),
 }));
 
-vi.mock("../../cli/plugins-registry-refresh.js", () => ({
+vi.mock("../../plugins/registry-refresh.js", () => ({
   refreshPluginRegistryAfterConfigMutation: refreshPluginRegistryAfterConfigMutationMock,
 }));
 
@@ -154,12 +155,7 @@ type MockCalls = {
   mock: { calls: unknown[][] };
 };
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== "object") {
-    throw new Error(`expected ${label}`);
-  }
-  return value as Record<string, unknown>;
-}
+const requireRecord = createRequireRecord("object", "expected-label");
 
 function getNestedRecord(record: Record<string, unknown>, key: string, label: string) {
   return requireRecord(record[key], label);

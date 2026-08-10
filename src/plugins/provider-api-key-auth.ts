@@ -1,7 +1,8 @@
 /** Builds API-key provider auth methods that write profiles and config updates. */
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { normalizeUniqueStringEntries } from "@openclaw/normalization-core/string-normalization";
-import { upsertAuthProfileWithLock } from "../agents/auth-profiles/profiles.js";
+import { upsertAuthProfileWithLockOrThrow } from "../agents/auth-profiles/profiles.js";
+import { resolveAgentModelPrimaryValue } from "../config/model-input.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { SecretInput } from "../config/types.secrets.js";
 import { createLazyRuntimeSurface } from "../shared/lazy-runtime.js";
@@ -11,6 +12,10 @@ import type {
   ProviderAuthMethodNonInteractiveContext,
   ProviderPluginWizardSetup,
 } from "./types.js";
+
+type ProviderAuthMethodNonInteractiveValidationContext = Parameters<
+  NonNullable<ProviderAuthMethod["validateNonInteractive"]>
+>[0];
 
 type ProviderApiKeyAuthMethodOptions = {
   providerId: string;
@@ -26,14 +31,13 @@ type ProviderApiKeyAuthMethodOptions = {
   profileIds?: string[];
   allowProfile?: boolean;
   defaultModel?: string;
+  preserveExistingPrimary?: boolean;
   expectedProviders?: string[];
   metadata?: Record<string, string>;
   noteMessage?: string;
   noteTitle?: string;
   applyConfig?: (cfg: OpenClawConfig) => OpenClawConfig;
 };
-
-type UpsertAuthProfileParams = Parameters<typeof upsertAuthProfileWithLock>[0];
 
 const loadProviderApiKeyAuthRuntime = createLazyRuntimeSurface(
   () => import("./provider-api-key-auth.runtime.js"),
@@ -60,20 +64,12 @@ function resolveProfileIds(params: {
   return [resolveProfileId(params)];
 }
 
-async function upsertAuthProfileWithLockOrThrow(params: UpsertAuthProfileParams): Promise<void> {
-  const updated = await upsertAuthProfileWithLock(params);
-  if (!updated) {
-    throw new Error(
-      "Failed to update auth profile store; the auth store lock may be busy. Wait a moment and retry.",
-    );
-  }
-}
-
 async function applyApiKeyConfig(params: {
   ctx: ProviderAuthMethodNonInteractiveContext;
   providerId: string;
   profileIds: string[];
   defaultModel?: string;
+  preserveExistingPrimary?: boolean;
   applyConfig?: (cfg: OpenClawConfig) => OpenClawConfig;
 }) {
   const { applyAuthProfileConfig, applyPrimaryModel } = await loadProviderApiKeyAuthRuntime();
@@ -88,18 +84,40 @@ async function applyApiKeyConfig(params: {
   if (params.applyConfig) {
     next = params.applyConfig(next);
   }
-  return params.defaultModel ? applyPrimaryModel(next, params.defaultModel) : next;
+  if (!params.defaultModel) {
+    return next;
+  }
+  if (
+    params.preserveExistingPrimary === true &&
+    resolveAgentModelPrimaryValue(next.agents?.defaults?.model) !== undefined
+  ) {
+    return next;
+  }
+  return applyPrimaryModel(next, params.defaultModel);
 }
 
 /** Creates a provider auth method that captures, stores, and configures API-key credentials. */
 export function createProviderApiKeyAuthMethod(
   params: ProviderApiKeyAuthMethodOptions,
 ): ProviderAuthMethod {
+  const resolveNonInteractiveCredential = async (
+    ctx: ProviderAuthMethodNonInteractiveValidationContext,
+  ) => {
+    const opts = ctx.opts as Record<string, unknown> | undefined;
+    return await ctx.resolveApiKey({
+      provider: params.providerId,
+      flagValue: resolveStringOption(opts, params.optionKey),
+      flagName: params.flagName,
+      envVar: params.envVar,
+      ...(params.allowProfile === false ? { allowProfile: false } : {}),
+    });
+  };
   return {
     id: params.methodId,
     label: params.label,
     hint: params.hint,
     kind: "api_key",
+    starterModel: params.defaultModel,
     wizard: params.wizard,
     run: async (ctx) => {
       const opts = ctx.opts as Record<string, unknown> | undefined;
@@ -166,15 +184,9 @@ export function createProviderApiKeyAuthMethod(
         ...(params.defaultModel ? { defaultModel: params.defaultModel } : {}),
       };
     },
+    validateNonInteractive: async (ctx) => Boolean(await resolveNonInteractiveCredential(ctx)),
     runNonInteractive: async (ctx) => {
-      const opts = ctx.opts as Record<string, unknown> | undefined;
-      const resolved = await ctx.resolveApiKey({
-        provider: params.providerId,
-        flagValue: resolveStringOption(opts, params.optionKey),
-        flagName: params.flagName,
-        envVar: params.envVar,
-        ...(params.allowProfile === false ? { allowProfile: false } : {}),
-      });
+      const resolved = await resolveNonInteractiveCredential(ctx);
       if (!resolved) {
         return null;
       }
@@ -203,6 +215,7 @@ export function createProviderApiKeyAuthMethod(
         providerId: params.providerId,
         profileIds,
         defaultModel: params.defaultModel,
+        preserveExistingPrimary: params.preserveExistingPrimary,
         applyConfig: params.applyConfig,
       });
     },

@@ -7,10 +7,14 @@ import crypto from "node:crypto";
 import type { CallGatewayOptions } from "../../gateway/call.js";
 import { formatErrorMessage } from "../../infra/errors.js";
 import { createSubsystemLogger } from "../../logging/subsystem.js";
-import type { GatewayMessageChannel } from "../../utils/message-channel.js";
+import { splitMediaFromOutput } from "../../media/parse.js";
+import { parseAgentSessionKey } from "../../sessions/session-key-utils.js";
 import { resolveNestedAgentLaneForSession } from "../lanes.js";
 import {
+  type AgentWaitResult,
   type AssistantReplySnapshot,
+  hasUpdatedAssistantReplySnapshot,
+  isRecoverableAgentWaitError,
   readLatestAssistantReplySnapshot,
   waitForAgentRun,
 } from "../run-wait.js";
@@ -40,21 +44,37 @@ let sessionsSendA2ADeps: {
   callGateway: GatewayCaller;
 } = defaultSessionsSendA2ADeps;
 
+function isDeliveryFailureWait(wait: AgentWaitResult): boolean {
+  return (
+    (wait.status === "error" && !isRecoverableAgentWaitError(wait.error)) ||
+    (wait.status === "timeout" && wait.pendingError === true)
+  );
+}
+
 async function deliverAnnounceReply(params: {
   announceTarget: AnnounceTarget;
   message: string;
   runContextId: string;
+  targetSessionKey: string;
 }) {
-  const message = params.message.trim();
-  if (!message) {
+  // Gateway chooses media roots before its later outbound directive parse, so
+  // project the media and its producing agent at the announcement boundary.
+  const { text: message, mediaUrls, audioAsVoice } = splitMediaFromOutput(params.message.trim());
+  if (!message && !mediaUrls?.length) {
     return;
   }
+  const mediaAgentId = mediaUrls?.length
+    ? parseAgentSessionKey(params.targetSessionKey)?.agentId
+    : undefined;
   try {
     await sessionsSendA2ADeps.callGateway({
       method: "send",
       params: {
         to: params.announceTarget.to,
         message,
+        ...(mediaUrls?.length ? { mediaUrls } : {}),
+        ...(mediaAgentId ? { agentId: mediaAgentId } : {}),
+        ...(audioAsVoice ? { asVoice: true } : {}),
         channel: params.announceTarget.channel,
         accountId: params.announceTarget.accountId,
         threadId: params.announceTarget.threadId,
@@ -79,10 +99,11 @@ export async function runSessionsSendA2AFlow(params: {
   announceTimeoutMs: number;
   maxPingPongTurns: number;
   requesterSessionKey?: string;
-  requesterChannel?: GatewayMessageChannel;
+  requesterChannel?: string;
   baseline?: AssistantReplySnapshot;
   roundOneReply?: string;
   waitRunId?: string;
+  notifyRequesterOnWaitFailure?: boolean;
 }) {
   const runContextId = params.waitRunId ?? "unknown";
   try {
@@ -97,15 +118,35 @@ export async function runSessionsSendA2AFlow(params: {
       if (wait.status === "ok") {
         const latestSnapshot = await readLatestAssistantReplySnapshot({
           sessionKey: params.targetSessionKey,
+          stopAtTranscriptArtifact: true,
           callGateway: sessionsSendA2ADeps.callGateway,
         });
-        const baselineFingerprint = params.baseline?.fingerprint;
-        primaryReply =
-          latestSnapshot.text &&
-          (!baselineFingerprint || latestSnapshot.fingerprint !== baselineFingerprint)
-            ? latestSnapshot.text
-            : undefined;
+        primaryReply = hasUpdatedAssistantReplySnapshot(latestSnapshot, params.baseline)
+          ? latestSnapshot.text
+          : undefined;
         latestReply = primaryReply;
+      } else {
+        if (
+          params.notifyRequesterOnWaitFailure === true &&
+          params.requesterSessionKey &&
+          isDeliveryFailureWait(wait)
+        ) {
+          const error =
+            typeof wait.error === "string" && wait.error.trim() ? `: ${wait.error.trim()}` : "";
+          await runAgentStep({
+            sessionKey: params.requesterSessionKey,
+            message:
+              `sessions_send delivery to ${params.displayKey} failed${error}. ` +
+              "The target may not have received the message; retry or report the failure instead of assuming delivery succeeded.",
+            extraSystemPrompt:
+              "A previous sessions_send delivery failed after it was accepted. Decide whether to retry, use another route, or report the failure. Do not assume the target received the message.",
+            timeoutMs: params.announceTimeoutMs,
+            lane: resolveNestedAgentLaneForSession(params.requesterSessionKey),
+            sourceSessionKey: params.targetSessionKey,
+            sourceTool: "sessions_send",
+          });
+        }
+        return;
       }
     }
     if (!latestReply) {
@@ -123,14 +164,13 @@ export async function runSessionsSendA2AFlow(params: {
 
     // A same-session send is a human-facing source-channel reply, not a true
     // agent-to-agent announcement. Asking the same session to decide whether to
-    // announce can learn stale ANNOUNCE_SKIP patterns from its own history and
-    // silently drop a normal channel response.
-    if (
+    // announce can re-run the same prompt and duplicate source-reply side effects.
+    const sameSessionSourceReply =
+      params.requesterSessionKey && params.requesterSessionKey === params.targetSessionKey;
+    const canDirectDeliverSameSessionReply =
       announceTarget &&
-      params.requesterSessionKey &&
-      params.requesterSessionKey === params.targetSessionKey &&
-      params.requesterChannel === announceTarget.channel
-    ) {
+      (!params.requesterChannel || params.requesterChannel === announceTarget.channel);
+    if (sameSessionSourceReply && canDirectDeliverSameSessionReply) {
       if (params.waitRunId && !params.roundOneReply && !params.baseline) {
         return;
       }
@@ -138,7 +178,11 @@ export async function runSessionsSendA2AFlow(params: {
         announceTarget,
         message: latestReply,
         runContextId,
+        targetSessionKey: params.targetSessionKey,
       });
+      return;
+    }
+    if (sameSessionSourceReply && !announceTarget) {
       return;
     }
 
@@ -215,6 +259,7 @@ export async function runSessionsSendA2AFlow(params: {
         announceTarget,
         message: announceReply,
         runContextId,
+        targetSessionKey: params.targetSessionKey,
       });
     }
   } catch (err) {
@@ -225,7 +270,7 @@ export async function runSessionsSendA2AFlow(params: {
   }
 }
 
-export const testing = {
+const testing = {
   setDepsForTest(overrides?: Partial<{ callGateway: GatewayCaller }>) {
     sessionsSendA2ADeps = overrides
       ? {
@@ -235,4 +280,9 @@ export const testing = {
       : defaultSessionsSendA2ADeps;
   },
 };
-export { testing as __testing };
+
+if (process.env.VITEST || process.env.NODE_ENV === "test") {
+  (globalThis as Record<PropertyKey, unknown>)[Symbol.for("openclaw.sessionsSendA2ATestApi")] = {
+    testing,
+  };
+}

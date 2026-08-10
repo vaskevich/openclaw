@@ -6,9 +6,9 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { describe, expect, it } from "vitest";
-import { parseArgs, runCase } from "../../scripts/profile-extension-memory.mjs";
+import { parseArgs, runCase } from "../../scripts/profile-extension-memory.mts";
 
-const SCRIPT_PATH = path.resolve("scripts/profile-extension-memory.mjs");
+const SCRIPT_PATH = path.resolve("scripts/profile-extension-memory.mts");
 
 async function waitForCondition(predicate: () => boolean, timeoutMs = 5_000): Promise<void> {
   const started = Date.now();
@@ -17,7 +17,7 @@ async function waitForCondition(predicate: () => boolean, timeoutMs = 5_000): Pr
       return;
     }
     await new Promise((resolve) => {
-      setTimeout(resolve, 50);
+      setTimeout(resolve, 10);
     });
   }
   throw new Error("timed out waiting for condition");
@@ -77,7 +77,9 @@ describe("scripts/profile-extension-memory", () => {
 
     expect(result.status).toBe(0);
     expect(result.stderr).toBe("");
-    expect(result.stdout).toContain("Usage: node scripts/profile-extension-memory.mjs");
+    expect(result.stdout).toContain(
+      "Usage: node --import tsx scripts/profile-extension-memory.mts",
+    );
   });
 
   it("stops parsing options after the argument terminator", () => {
@@ -99,7 +101,7 @@ describe("scripts/profile-extension-memory", () => {
       ["--timeout-ms", "1e3"],
       ["--combined-timeout-ms", "90000ms"],
       ["--top", "0x10"],
-    ];
+    ] as const;
 
     for (const [flag, value] of cases) {
       const result = runProfileExtensionMemory([flag, value]);
@@ -259,7 +261,7 @@ describe("scripts/profile-extension-memory", () => {
       name: "spawn-error",
       body: "",
       timeoutMs: 30_000,
-      spawnImpl: () => {
+      spawnImpl: (() => {
         const child = new EventEmitter() as EventEmitter & {
           kill: () => boolean;
           stderr: EventEmitter;
@@ -270,7 +272,7 @@ describe("scripts/profile-extension-memory", () => {
         child.kill = () => true;
         queueMicrotask(() => child.emit("error", new Error("spawn denied")));
         return child;
-      },
+      }) as unknown as typeof spawn,
     });
 
     expect(Date.now() - startedAt).toBeLessThan(1000);
@@ -312,7 +314,8 @@ describe("scripts/profile-extension-memory", () => {
           hookPath,
           name: "timeout-descendant",
           repoRoot: root,
-          timeoutMs: 1_000,
+          shutdownGraceMs: 100,
+          timeoutMs: 250,
         });
 
         await waitForCondition(() => existsSync(descendantPidPath));
@@ -363,7 +366,7 @@ describe("scripts/profile-extension-memory", () => {
           runnerPath,
           [
             `const { runCase } = await import(${JSON.stringify(
-              pathToFileURL(path.resolve("scripts/profile-extension-memory.mjs")).href,
+              pathToFileURL(path.resolve("scripts/profile-extension-memory.mts")).href,
             )});`,
             "void runCase({",
             `  body: ${JSON.stringify(body)},`,
@@ -371,6 +374,7 @@ describe("scripts/profile-extension-memory", () => {
             `  hookPath: ${JSON.stringify(hookPath)},`,
             "  name: 'parent-signal-descendant',",
             `  repoRoot: ${JSON.stringify(root)},`,
+            "  shutdownGraceMs: 100,",
             "  timeoutMs: 30000,",
             "});",
           ].join("\n"),

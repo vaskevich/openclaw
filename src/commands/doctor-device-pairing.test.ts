@@ -1,6 +1,7 @@
-// Doctor device pairing tests cover device-pairing checks, repair prompts, and diagnostics.
 import fs from "node:fs/promises";
 import path from "node:path";
+// Doctor device pairing tests cover device-pairing checks, repair prompts, and diagnostics.
+import { createRequireRecord } from "openclaw/plugin-sdk/test-fixtures";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { storeDeviceAuthToken } from "../infra/device-auth-store.js";
 import {
@@ -52,12 +53,7 @@ function requireNoteTitle(callIndex = 0): unknown {
   return title;
 }
 
-function requireRecord(value: unknown, label: string): Record<string, unknown> {
-  if (!value || typeof value !== "object") {
-    throw new Error(`expected ${label} record`);
-  }
-  return value as Record<string, unknown>;
-}
+const requireRecord = createRequireRecord("object", "expected-label-record-short");
 
 describe("noteDevicePairingHealth", () => {
   let collectDevicePairingHealthFindings: typeof import("./doctor-device-pairing.js").collectDevicePairingHealthFindings;
@@ -155,7 +151,7 @@ describe("noteDevicePairingHealth", () => {
     });
   });
 
-  it("warns when local pairing state is corrupt instead of treating it as empty", async () => {
+  it("warns when a legacy pairing store file has not been imported into SQLite", async () => {
     await withTempDir("openclaw-doctor-device-pairing-", async (stateDir) => {
       await withEnvAsync(
         {
@@ -176,7 +172,7 @@ describe("noteDevicePairingHealth", () => {
           const message = requireNoteMessage();
           expect(requireNoteTitle()).toBe("Device pairing");
           expect(message).toContain("paired.json");
-          expect(message).toContain("refused to treat it as empty");
+          expect(message).toContain("has not been imported");
           expect(await fs.readFile(pairedPath, "utf8")).toBe("{not-json}");
 
           const findings = await collectDevicePairingHealthFindings({
@@ -186,9 +182,9 @@ describe("noteDevicePairingHealth", () => {
             expect.objectContaining({
               checkId: "core/doctor/device-pairing",
               severity: "warning",
-              path: pairedPath,
-              requirement: "pairing-store-parse",
-              message: expect.stringContaining("refused to treat it as empty"),
+              path: "devices.legacy-store",
+              requirement: "pairing-store-legacy-file",
+              message: expect.stringContaining("has not been imported"),
             }),
           ]);
           expect(await fs.readFile(pairedPath, "utf8")).toBe("{not-json}");
@@ -198,24 +194,15 @@ describe("noteDevicePairingHealth", () => {
   });
 
   it("warns when the local cached device token predates the gateway rotation", async () => {
-    await withApprovedOperatorPairing(async ({ stateDir, identity }) => {
+    await withApprovedOperatorPairing(async ({ identity }) => {
+      const now = vi.spyOn(Date, "now").mockReturnValue(1);
       storeDeviceAuthToken({
         deviceId: identity.deviceId,
         role: "operator",
         token: "stale-local-token",
         scopes: ["operator.read"],
       });
-      const deviceAuthPath = path.join(stateDir, "identity", "device-auth.json");
-      const store = JSON.parse(await fs.readFile(deviceAuthPath, "utf8")) as {
-        version: 1;
-        deviceId: string;
-        tokens: Record<
-          string,
-          { token: string; role: string; scopes: string[]; updatedAtMs: number }
-        >;
-      };
-      store.tokens.operator.updatedAtMs = 1;
-      await fs.writeFile(deviceAuthPath, `${JSON.stringify(store, null, 2)}\n`, "utf8");
+      now.mockRestore();
 
       const rotated = await rotateDeviceToken({
         deviceId: identity.deviceId,

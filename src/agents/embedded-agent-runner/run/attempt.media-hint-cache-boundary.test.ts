@@ -27,15 +27,17 @@ const musicGenerationTaskStatusMocks = vi.hoisted(() => ({
   MUSIC_GENERATION_TASK_KIND: "music_generation",
 }));
 
-vi.mock("../../image-generation-task-status.js", () => imageGenerationTaskStatusMocks);
-vi.mock("../../music-generation-task-status.js", () => musicGenerationTaskStatusMocks);
-vi.mock("../../video-generation-task-status.js", () => videoGenerationTaskStatusMocks);
+vi.mock("../../media-generation-task-status.js", () => ({
+  ...imageGenerationTaskStatusMocks,
+  ...musicGenerationTaskStatusMocks,
+  ...videoGenerationTaskStatusMocks,
+}));
 
 import {
   ensureSystemPromptCacheBoundary,
   SYSTEM_PROMPT_CACHE_BOUNDARY,
   splitSystemPromptCacheBoundary,
-} from "../../system-prompt-cache-boundary.js";
+} from "@openclaw/ai/internal/shared";
 import {
   appendModelIdentitySystemPrompt,
   buildModelIdentityPromptLine,

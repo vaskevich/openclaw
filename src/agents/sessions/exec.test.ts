@@ -2,57 +2,94 @@
 // termination semantics used by agent sessions.
 import { EventEmitter } from "node:events";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { createDeferred } from "../../../test/helpers/promise.js";
 
-const { killProcessTreeAndWaitMock, spawnMock, waitForChildProcessMock } = vi.hoisted(() => ({
-  killProcessTreeAndWaitMock: vi.fn(),
+const {
+  completionMock,
+  createTerminationControllerMock,
+  settleTerminationMock,
+  spawnMock,
+  terminateMock,
+  windowsLegacyOutput,
+} = vi.hoisted(() => ({
+  completionMock: vi.fn(),
+  createTerminationControllerMock: vi.fn(),
+  settleTerminationMock: vi.fn(),
   spawnMock: vi.fn(),
-  waitForChildProcessMock: vi.fn(),
+  terminateMock: vi.fn(),
+  windowsLegacyOutput: { enabled: false },
 }));
 
-vi.mock("node:child_process", () => ({
-  spawn: spawnMock,
+vi.mock("../../infra/windows-encoding.js", async (importOriginal) => {
+  const { createWindowsOutputDecoder } =
+    await importOriginal<typeof import("../../infra/windows-encoding.js")>();
+  return {
+    createWindowsOutputDecoder: (params?: Parameters<typeof createWindowsOutputDecoder>[0]) =>
+      createWindowsOutputDecoder({
+        ...params,
+        ...(windowsLegacyOutput.enabled
+          ? { platform: "win32", windowsEncoding: "gbk" }
+          : { platform: "linux" }),
+      }),
+  };
+});
+
+vi.mock("../../process/child-process.js", () => ({
+  releaseChildProcessOutputAfterExit: vi.fn(() => vi.fn()),
 }));
 
-vi.mock("../utils/child-process.js", () => ({
-  waitForChildProcess: waitForChildProcessMock,
+vi.mock("../../process/exec.js", () => ({
+  spawnCommand: (...args: unknown[]) => {
+    const child = spawnMock(...args) as StubChild;
+    const completion = completionMock(child).then((code: number | null) => ({
+      exitCode: code,
+      failed: false,
+    }));
+    // oxlint-disable-next-line unicorn/no-thenable -- Execa subprocesses are event emitters and promises.
+    child.then = completion.then.bind(completion);
+    return child;
+  },
 }));
 
-vi.mock("../../process/kill-tree.js", () => ({
-  killProcessTreeAndWait: killProcessTreeAndWaitMock,
+vi.mock("../../process/exec-termination.js", () => ({
+  createCommandTerminationController: createTerminationControllerMock,
 }));
 
 type StubChild = EventEmitter & {
   kill: ReturnType<typeof vi.fn>;
+  nodeChildProcess: StubChild;
   pid?: number;
   stderr: EventEmitter;
   stdout: EventEmitter;
+  then: Promise<unknown>["then"];
 };
 
 function createStubChild(): StubChild {
   const child = new EventEmitter() as StubChild;
+  child.nodeChildProcess = child;
   child.pid = 1234;
   child.stdout = new EventEmitter();
   child.stderr = new EventEmitter();
   child.kill = vi.fn();
+  // oxlint-disable-next-line unicorn/no-thenable -- Stub matches Execa's event-emitting promise shape.
+  child.then = vi.fn() as unknown as Promise<unknown>["then"];
   return child;
-}
-
-function createDeferred<T>() {
-  let resolve!: (value: T) => void;
-  let reject!: (error: Error) => void;
-  const promise = new Promise<T>((res, rej) => {
-    resolve = res;
-    reject = rej;
-  });
-  return { promise, resolve, reject };
 }
 
 describe("execCommand", () => {
   beforeEach(() => {
-    killProcessTreeAndWaitMock.mockReset();
-    killProcessTreeAndWaitMock.mockResolvedValue(undefined);
+    createTerminationControllerMock.mockReset();
+    terminateMock.mockReset();
+    terminateMock.mockReturnValue(false);
+    settleTerminationMock.mockReset();
+    settleTerminationMock.mockResolvedValue(undefined);
+    createTerminationControllerMock.mockReturnValue({
+      terminate: terminateMock,
+      settle: settleTerminationMock,
+    });
     spawnMock.mockReset();
-    waitForChildProcessMock.mockReset();
+    completionMock.mockReset();
+    windowsLegacyOutput.enabled = false;
     vi.useRealTimers();
   });
 
@@ -67,7 +104,7 @@ describe("execCommand", () => {
     const child = createStubChild();
     const wait = createDeferred<number | null>();
     spawnMock.mockReturnValue(child);
-    waitForChildProcessMock.mockReturnValue(wait.promise);
+    completionMock.mockReturnValue(wait.promise);
     const { execCommand } = await import("./exec.js");
 
     const resultPromise = execCommand("cmd", [], "/tmp", { maxOutputChars: 256 });
@@ -89,27 +126,35 @@ describe("execCommand", () => {
     const child = createStubChild();
     const wait = createDeferred<number | null>();
     spawnMock.mockReturnValue(child);
-    waitForChildProcessMock.mockReturnValue(wait.promise);
+    completionMock.mockReturnValue(wait.promise);
     const { execCommand } = await import("./exec.js");
 
     const resultPromise = execCommand("cmd", ["arg"], "/tmp");
     wait.resolve(0);
     await resultPromise;
 
-    expect(spawnMock).toHaveBeenCalledWith("cmd", ["arg"], {
+    expect(spawnMock).toHaveBeenCalledWith(["cmd", "arg"], {
+      buffer: false,
+      cancelSignal: expect.any(AbortSignal),
       cwd: "/tmp",
       detached: process.platform !== "win32",
-      shell: false,
+      forceKillAfterDelay: 5000,
+      reject: false,
       stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
     });
+    expect(createTerminationControllerMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        child,
+        processTree: { mode: "graceful", graceMs: 5000 },
+      }),
+    );
   });
 
   it("honors caller-supplied small output caps", async () => {
     const child = createStubChild();
     const wait = createDeferred<number | null>();
     spawnMock.mockReturnValue(child);
-    waitForChildProcessMock.mockReturnValue(wait.promise);
+    completionMock.mockReturnValue(wait.promise);
     const { execCommand } = await import("./exec.js");
 
     const resultPromise = execCommand("cmd", [], "/tmp", { maxOutputChars: 3 });
@@ -122,28 +167,158 @@ describe("execCommand", () => {
     expect(result.stdoutTruncatedChars).toBe(3);
   });
 
+  it("keeps caller-capped retained output UTF-16 safe", async () => {
+    const child = createStubChild();
+    const wait = createDeferred<number | null>();
+    spawnMock.mockReturnValue(child);
+    completionMock.mockReturnValue(wait.promise);
+    const { execCommand } = await import("./exec.js");
+
+    const resultPromise = execCommand("cmd", [], "/tmp", { maxOutputChars: 2 });
+    child.stdout.emit("data", Buffer.from("A😀B"));
+    child.stderr.emit("data", Buffer.from("C😀D"));
+    wait.resolve(0);
+
+    const result = await resultPromise;
+    expect(result.stdout).toBe("B");
+    expect(result.stderr).toBe("D");
+    expect(result.stdoutTruncatedChars).toBe(3);
+    expect(result.stderrTruncatedChars).toBe(3);
+  });
+
+  it("preserves UTF-8 characters split across stdout and stderr chunks", async () => {
+    const child = createStubChild();
+    const wait = createDeferred<number | null>();
+    spawnMock.mockReturnValue(child);
+    completionMock.mockReturnValue(wait.promise);
+    const { execCommand } = await import("./exec.js");
+
+    const resultPromise = execCommand("cmd", [], "/tmp");
+    const stdout = Buffer.from("stdout-😀-complete", "utf8");
+    const stderr = Buffer.from("stderr-😀-complete", "utf8");
+    child.stdout.emit("data", stdout.subarray(0, 9));
+    child.stderr.emit("data", stderr.subarray(0, 9));
+    child.stdout.emit("data", stdout.subarray(9));
+    child.stderr.emit("data", stderr.subarray(9));
+    wait.resolve(0);
+
+    const result = await resultPromise;
+    expect(result.stdout).toBe("stdout-😀-complete");
+    expect(result.stderr).toBe("stderr-😀-complete");
+  });
+
+  it("preserves leading UTF-8 BOMs in stdout and stderr", async () => {
+    const child = createStubChild();
+    const wait = createDeferred<number | null>();
+    spawnMock.mockReturnValue(child);
+    completionMock.mockReturnValue(wait.promise);
+    const { execCommand } = await import("./exec.js");
+
+    const resultPromise = execCommand("cmd", [], "/tmp");
+    const stdout = Buffer.from("\uFEFFstdout", "utf8");
+    const stderr = Buffer.from("\uFEFFstderr", "utf8");
+    child.stdout.emit("data", stdout.subarray(0, 1));
+    child.stdout.emit("data", stdout.subarray(1, 2));
+    child.stdout.emit("data", stdout.subarray(2));
+    child.stderr.emit("data", stderr.subarray(0, 2));
+    child.stderr.emit("data", stderr.subarray(2));
+    wait.resolve(0);
+
+    await expect(resultPromise).resolves.toMatchObject({
+      stdout: "\uFEFFstdout",
+      stderr: "\uFEFFstderr",
+    });
+  });
+
+  it("decodes split GBK stdout on legacy-codepage Windows", async () => {
+    windowsLegacyOutput.enabled = true;
+    const child = createStubChild();
+    const wait = createDeferred<number | null>();
+    spawnMock.mockReturnValue(child);
+    completionMock.mockReturnValue(wait.promise);
+    const { execCommand } = await import("./exec.js");
+
+    const resultPromise = execCommand("cmd", [], "/tmp");
+    child.stdout.emit("data", Buffer.from([0xb2]));
+    child.stdout.emit("data", Buffer.from([0xe2, 0xca]));
+    child.stdout.emit("data", Buffer.from([0xd4]));
+    wait.resolve(0);
+
+    await expect(resultPromise).resolves.toMatchObject({ stdout: "测试" });
+  });
+
+  it("decodes split GBK stderr on legacy-codepage Windows", async () => {
+    windowsLegacyOutput.enabled = true;
+    const child = createStubChild();
+    const wait = createDeferred<number | null>();
+    spawnMock.mockReturnValue(child);
+    completionMock.mockReturnValue(wait.promise);
+    const { execCommand } = await import("./exec.js");
+
+    const resultPromise = execCommand("cmd", [], "/tmp");
+    child.stderr.emit("data", Buffer.from([0xc4]));
+    child.stderr.emit("data", Buffer.from([0xe3, 0xba]));
+    child.stderr.emit("data", Buffer.from([0xc3]));
+    wait.resolve(0);
+
+    await expect(resultPromise).resolves.toMatchObject({ stderr: "你好" });
+  });
+
+  it("preserves split UTF-8 output on legacy-codepage Windows", async () => {
+    windowsLegacyOutput.enabled = true;
+    const child = createStubChild();
+    const wait = createDeferred<number | null>();
+    spawnMock.mockReturnValue(child);
+    completionMock.mockReturnValue(wait.promise);
+    const { execCommand } = await import("./exec.js");
+
+    const resultPromise = execCommand("cmd", [], "/tmp");
+    const stdout = Buffer.from("测试", "utf8");
+    child.stdout.emit("data", stdout.subarray(0, 1));
+    child.stdout.emit("data", stdout.subarray(1, 3));
+    child.stdout.emit("data", stdout.subarray(3));
+    wait.resolve(0);
+
+    await expect(resultPromise).resolves.toMatchObject({ stdout: "测试" });
+  });
+
+  it("flushes incomplete UTF-8 sequences when the process exits", async () => {
+    const child = createStubChild();
+    const wait = createDeferred<number | null>();
+    spawnMock.mockReturnValue(child);
+    completionMock.mockReturnValue(wait.promise);
+    const { execCommand } = await import("./exec.js");
+
+    const resultPromise = execCommand("cmd", [], "/tmp");
+    child.stdout.emit("data", Buffer.from([0xe2, 0x82]));
+    child.stderr.emit("data", Buffer.from([0xf0, 0x9f, 0x98]));
+    wait.resolve(0);
+
+    const result = await resultPromise;
+    expect(result.stdout).toBe("�");
+    expect(result.stderr).toBe("�");
+  });
+
   it("fails instead of silently truncating default exec output", async () => {
     const child = createStubChild();
     const wait = createDeferred<number | null>();
     spawnMock.mockReturnValue(child);
-    waitForChildProcessMock.mockReturnValue(wait.promise);
+    completionMock.mockReturnValue(wait.promise);
     const { execCommand } = await import("./exec.js");
 
     const resultPromise = execCommand("cmd", [], "/tmp");
-    child.stdout.emit("data", Buffer.from("x".repeat(16 * 1024 * 1024 + 1)));
+    child.stdout.emit("data", Buffer.from(`${"x".repeat(16 * 1024 * 1024 - 1)}😀`));
     wait.resolve(0);
 
     const result = await resultPromise;
-    expect(killProcessTreeAndWaitMock).toHaveBeenCalledWith(1234, {
-      detached: process.platform !== "win32",
-      graceMs: 5000,
-    });
+    expect(terminateMock).toHaveBeenCalledOnce();
     expect(child.kill).not.toHaveBeenCalled();
     expect(result.code).toBe(1);
     expect(result.killed).toBe(true);
     expect(result.outputLimitExceeded).toBe("stdout");
-    expect(result.stdout.length).toBe(16 * 1024 * 1024);
-    expect(result.stdoutTruncatedChars).toBe(1);
+    expect(result.stdout.length).toBe(16 * 1024 * 1024 - 1);
+    expect(result.stdout.endsWith("x")).toBe(true);
+    expect(result.stdoutTruncatedChars).toBe(2);
     expect(result.stderr).toContain("exec stdout exceeded output limit");
   });
 
@@ -154,15 +329,12 @@ describe("execCommand", () => {
     const child = createStubChild();
     const wait = createDeferred<number | null>();
     spawnMock.mockReturnValue(child);
-    waitForChildProcessMock.mockReturnValue(wait.promise);
+    completionMock.mockReturnValue(wait.promise);
     const { execCommand } = await import("./exec.js");
 
     const resultPromise = execCommand("cmd", [], "/tmp", { timeout: 10 });
     await vi.advanceTimersByTimeAsync(10);
-    expect(killProcessTreeAndWaitMock).toHaveBeenCalledWith(1234, {
-      detached: process.platform !== "win32",
-      graceMs: 5000,
-    });
+    expect(terminateMock).toHaveBeenCalledOnce();
     expect(child.kill).not.toHaveBeenCalled();
 
     wait.resolve(null);
@@ -170,88 +342,42 @@ describe("execCommand", () => {
     expect(result.killed).toBe(true);
   });
 
-  it("waits for process-tree cleanup before resolving killed output-limit results", async () => {
+  it("does not resolve a killed command until process-tree cleanup settles", async () => {
+    vi.useFakeTimers();
     const child = createStubChild();
     const wait = createDeferred<number | null>();
-    const cleanup = createDeferred<void>();
+    const cleanup = createDeferred();
     spawnMock.mockReturnValue(child);
-    waitForChildProcessMock.mockReturnValue(wait.promise);
-    killProcessTreeAndWaitMock.mockReturnValue(cleanup.promise);
+    completionMock.mockReturnValue(wait.promise);
+    settleTerminationMock.mockReturnValue(cleanup.promise);
     const { execCommand } = await import("./exec.js");
 
-    const resultPromise = execCommand("cmd", [], "/tmp");
-    child.stdout.emit("data", Buffer.from("x".repeat(16 * 1024 * 1024 + 1)));
-    wait.resolve(0);
+    const resultPromise = execCommand("cmd", [], "/tmp", { timeout: 10 });
+    await vi.advanceTimersByTimeAsync(10);
+    wait.resolve(null);
     let resolved = false;
     void resultPromise.then(() => {
       resolved = true;
     });
-    await Promise.resolve();
+    await vi.advanceTimersByTimeAsync(0);
 
     expect(resolved).toBe(false);
     cleanup.resolve();
-    const result = await resultPromise;
-    expect(result.killed).toBe(true);
-    expect(result.outputLimitExceeded).toBe("stdout");
+    await expect(resultPromise).resolves.toMatchObject({ killed: true });
   });
 
-  it("terminates aborted commands through the process-tree killer", async () => {
+  it("does not crash when stdout or stderr emit an error event", async () => {
     const child = createStubChild();
     const wait = createDeferred<number | null>();
-    const controller = new AbortController();
     spawnMock.mockReturnValue(child);
-    waitForChildProcessMock.mockReturnValue(wait.promise);
+    completionMock.mockReturnValue(wait.promise);
     const { execCommand } = await import("./exec.js");
 
-    const resultPromise = execCommand("cmd", [], "/tmp", { signal: controller.signal });
-    controller.abort();
-    wait.resolve(null);
+    const resultPromise = execCommand("cmd", [], "/tmp");
+    child.stdout.emit("error", new Error("EPIPE"));
+    child.stderr.emit("error", new Error("EIO"));
+    wait.resolve(0);
 
-    const result = await resultPromise;
-    expect(killProcessTreeAndWaitMock).toHaveBeenCalledWith(1234, {
-      detached: process.platform !== "win32",
-      graceMs: 5000,
-    });
-    expect(result.killed).toBe(true);
-  });
-
-  it("falls back to direct child kill when abort races a pid-less spawn failure", async () => {
-    const child = createStubChild();
-    delete child.pid;
-    const controller = new AbortController();
-    controller.abort();
-    spawnMock.mockReturnValue(child);
-    waitForChildProcessMock.mockRejectedValue(new Error("spawn failed"));
-    const { execCommand } = await import("./exec.js");
-
-    const result = await execCommand("cmd", [], "/tmp", { signal: controller.signal });
-
-    expect(killProcessTreeAndWaitMock).not.toHaveBeenCalled();
-    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
-    expect(result).toMatchObject({ code: 1, killed: true });
-  });
-
-  it("starts cleanup once when output overflow, abort, and timeout race", async () => {
-    vi.useFakeTimers();
-    const child = createStubChild();
-    const wait = createDeferred<number | null>();
-    const controller = new AbortController();
-    spawnMock.mockReturnValue(child);
-    waitForChildProcessMock.mockReturnValue(wait.promise);
-    const { execCommand } = await import("./exec.js");
-
-    const resultPromise = execCommand("cmd", [], "/tmp", {
-      signal: controller.signal,
-      timeout: 10,
-    });
-    child.stdout.emit("data", Buffer.from("x".repeat(16 * 1024 * 1024 + 1)));
-    controller.abort();
-    await vi.advanceTimersByTimeAsync(10);
-    wait.resolve(null);
-
-    const result = await resultPromise;
-    expect(killProcessTreeAndWaitMock).toHaveBeenCalledTimes(1);
-    expect(result.killed).toBe(true);
-    expect(result.outputLimitExceeded).toBe("stdout");
+    await expect(resultPromise).resolves.toMatchObject({ code: 0 });
   });
 });

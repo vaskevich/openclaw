@@ -19,7 +19,7 @@ import {
 
 /** Marker used to identify security-sensitive guard comments. */
 export const securitySensitiveGuardMarker = "<!-- openclaw:security-sensitive-guard -->";
-export const securitySensitiveChangedLabel = "security-sensitive-changed";
+const securitySensitiveChangedLabel = "security-sensitive-changed";
 export const allowSecuritySensitiveCommand = "/allow-security-sensitive-change";
 export {
   GITHUB_API_REQUEST_TIMEOUT_MS,
@@ -38,6 +38,16 @@ const securitySensitiveFiles = [
       "Controls ignored secret and local files, including common `.env` files, before they can be accidentally committed.",
   },
 ];
+
+/**
+ * @typedef {{
+ *   body?: string,
+ *   created_at?: string,
+ *   html_url?: string,
+ *   user?: { login?: string },
+ * }} GuardComment
+ * @typedef {{ login: string, source: string }} GuardActorCandidate
+ */
 
 export function securitySensitiveFileDefinitions() {
   return securitySensitiveFiles.map((entry) => ({ ...entry }));
@@ -84,6 +94,14 @@ function* securitySensitiveOverrideCandidates({ comments, expectedSha, newerThan
   }
 }
 
+/**
+ * @param {{
+ *   comments: GuardComment[],
+ *   expectedSha: string | null,
+ *   isSecurityMember: (login: string) => boolean,
+ *   newerThan?: string,
+ * }} options
+ */
 export function findSecuritySensitiveOverrideCommand({
   comments,
   expectedSha,
@@ -102,6 +120,14 @@ export function findSecuritySensitiveOverrideCommand({
   return null;
 }
 
+/**
+ * @param {{
+ *   comments: GuardComment[],
+ *   expectedSha: string | null,
+ *   isSecurityMember: (login: string) => Promise<boolean>,
+ *   newerThan?: string,
+ * }} input
+ */
 export async function findSecuritySensitiveOverrideCommandAsync(input) {
   for (const candidate of securitySensitiveOverrideCandidates(input)) {
     if (await input.isSecurityMember(candidate.login)) {
@@ -304,6 +330,12 @@ export function securitySensitiveGuardTrustedActorCandidates({
   return guardTrustedActorCandidates({ pullRequest, event, currentHeadSha });
 }
 
+/**
+ * @param {{
+ *   candidates: GuardActorCandidate[],
+ *   isSecuritySensitiveApprover: (login: string) => Promise<string | null>,
+ * }} options
+ */
 export async function findTrustedSecuritySensitiveGuardActor({
   candidates,
   isSecuritySensitiveApprover,

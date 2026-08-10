@@ -1,10 +1,11 @@
 /** Tests ACP runtime handle caching, reuse, re-ensure, and eviction behavior. */
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import {
   AcpRuntimeError,
   AcpSessionManager,
   baseCfg,
   createRuntime,
+  disposeAcpSessionManagerInstance,
   expectRecordFields,
   hoisted,
   installAcpSessionManagerTestLifecycle,
@@ -31,6 +32,7 @@ describe("AcpSessionManager runtime handles", () => {
 
     const manager = new AcpSessionManager();
     await manager.runTurn({
+      provenance: "system",
       cfg: baseCfg,
       sessionKey: "agent:codex:acp:session-1",
       text: "first",
@@ -38,6 +40,7 @@ describe("AcpSessionManager runtime handles", () => {
       requestId: "r1",
     });
     await manager.runTurn({
+      provenance: "system",
       cfg: baseCfg,
       sessionKey: "agent:codex:acp:session-1",
       text: "second",
@@ -47,6 +50,97 @@ describe("AcpSessionManager runtime handles", () => {
 
     expect(runtimeState.ensureSession).toHaveBeenCalledTimes(1);
     expect(runtimeState.runTurn).toHaveBeenCalledTimes(2);
+  });
+
+  it("disposes every retained runtime handle", async () => {
+    const runtimeState = createRuntime();
+    hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
+      id: "acpx",
+      runtime: runtimeState.runtime,
+    });
+    hoisted.readAcpSessionEntryMock.mockImplementation((input: unknown) => {
+      const sessionKey = (input as { sessionKey: string }).sessionKey;
+      return {
+        sessionKey,
+        storeSessionKey: sessionKey,
+        acp: readySessionMeta(),
+      };
+    });
+    const manager = new AcpSessionManager();
+
+    for (const [index, sessionKey] of [
+      "agent:claude:acp:session-1",
+      "agent:codex:acp:session-2",
+    ].entries()) {
+      await manager.runTurn({
+        provenance: "system",
+        cfg: baseCfg,
+        sessionKey,
+        text: `turn ${index + 1}`,
+        mode: "prompt",
+        requestId: `r${index + 1}`,
+      });
+    }
+
+    await disposeAcpSessionManagerInstance(manager, "gateway-shutdown");
+
+    expect(runtimeState.close).toHaveBeenCalledTimes(2);
+    expect(
+      new Set(
+        runtimeState.close.mock.calls.map(
+          ([input]) => (input as { handle: { sessionKey: string } }).handle.sessionKey,
+        ),
+      ),
+    ).toEqual(new Set(["agent:claude:acp:session-1", "agent:codex:acp:session-2"]));
+    expect(manager.getObservabilitySnapshot().runtimeCache.activeSessions).toBe(0);
+  });
+
+  it("cancels an active turn before closing its retained runtime handle", async () => {
+    const runtimeState = createRuntime();
+    let releaseTurn!: () => void;
+    const turnReleased = new Promise<void>((resolve) => {
+      releaseTurn = resolve;
+    });
+    const lifecycle: string[] = [];
+    runtimeState.runTurn.mockImplementation(async function* () {
+      await turnReleased;
+      yield { type: "done" as const };
+    });
+    runtimeState.cancel.mockImplementation(async () => {
+      lifecycle.push("cancel");
+      releaseTurn();
+    });
+    runtimeState.close.mockImplementation(async () => {
+      lifecycle.push("close");
+    });
+    hoisted.requireAcpRuntimeBackendMock.mockReturnValue({
+      id: "acpx",
+      runtime: runtimeState.runtime,
+    });
+    const sessionKey = "agent:claude:acp:active-session";
+    hoisted.readAcpSessionEntryMock.mockReturnValue({
+      sessionKey,
+      storeSessionKey: sessionKey,
+      acp: readySessionMeta(),
+    });
+    const manager = new AcpSessionManager();
+    const turnPromise = manager
+      .runTurn({
+        provenance: "system",
+        cfg: baseCfg,
+        sessionKey,
+        text: "active turn",
+        mode: "prompt",
+        requestId: "r-active",
+      })
+      .catch(() => undefined);
+    await vi.waitFor(() => expect(runtimeState.runTurn).toHaveBeenCalledOnce());
+
+    await disposeAcpSessionManagerInstance(manager, "gateway-shutdown");
+    await turnPromise;
+
+    expect(lifecycle).toEqual(["cancel", "close"]);
+    expect(manager.getObservabilitySnapshot().runtimeCache.activeSessions).toBe(0);
   });
 
   it("re-ensures cached runtime handles when the runtime config changes", async () => {
@@ -64,7 +158,7 @@ describe("AcpSessionManager runtime handles", () => {
       ...baseCfg,
       tools: {
         exec: {
-          security: "allowlist",
+          mode: "allowlist",
           safeBins: ["git"],
         },
       },
@@ -73,7 +167,7 @@ describe("AcpSessionManager runtime handles", () => {
       ...baseCfg,
       tools: {
         exec: {
-          security: "deny",
+          mode: "deny",
           safeBins: ["node"],
         },
       },
@@ -81,6 +175,7 @@ describe("AcpSessionManager runtime handles", () => {
 
     const manager = new AcpSessionManager();
     await manager.runTurn({
+      provenance: "system",
       cfg: allowlistCfg,
       sessionKey: "agent:codex:acp:session-1",
       text: "first",
@@ -88,6 +183,7 @@ describe("AcpSessionManager runtime handles", () => {
       requestId: "r1",
     });
     await manager.runTurn({
+      provenance: "system",
       cfg: denyCfg,
       sessionKey: "agent:codex:acp:session-1",
       text: "second",
@@ -129,6 +225,7 @@ describe("AcpSessionManager runtime handles", () => {
 
     const manager = new AcpSessionManager();
     await manager.runTurn({
+      provenance: "system",
       cfg: baseCfg,
       sessionKey: "agent:codex:acp:session-1",
       text: "first",
@@ -136,6 +233,7 @@ describe("AcpSessionManager runtime handles", () => {
       requestId: "r1",
     });
     await manager.runTurn({
+      provenance: "system",
       cfg: baseCfg,
       sessionKey: "agent:codex:acp:session-1",
       text: "second",
@@ -190,6 +288,7 @@ describe("AcpSessionManager runtime handles", () => {
 
     const manager = new AcpSessionManager();
     await manager.runTurn({
+      provenance: "system",
       cfg: baseCfg,
       sessionKey: "agent:codex:acp:session-1",
       text: "first",
@@ -210,6 +309,7 @@ describe("AcpSessionManager runtime handles", () => {
     });
 
     await manager.runTurn({
+      provenance: "system",
       cfg: baseCfg,
       sessionKey: "agent:codex:acp:session-1",
       text: "second",
@@ -235,6 +335,7 @@ describe("AcpSessionManager runtime handles", () => {
 
     const managerA = new AcpSessionManager();
     await managerA.runTurn({
+      provenance: "system",
       cfg: baseCfg,
       sessionKey: "agent:codex:acp:session-1",
       text: "before restart",
@@ -243,6 +344,7 @@ describe("AcpSessionManager runtime handles", () => {
     });
     const managerB = new AcpSessionManager();
     await managerB.runTurn({
+      provenance: "system",
       cfg: baseCfg,
       sessionKey: "agent:codex:acp:session-1",
       text: "after restart",
@@ -280,6 +382,7 @@ describe("AcpSessionManager runtime handles", () => {
 
     const manager = new AcpSessionManager();
     await manager.runTurn({
+      provenance: "system",
       cfg: baseCfg,
       sessionKey,
       text: "after restart",
@@ -323,6 +426,7 @@ describe("AcpSessionManager runtime handles", () => {
 
     const manager = new AcpSessionManager();
     await manager.runTurn({
+      provenance: "system",
       cfg: baseCfg,
       sessionKey,
       text: "after restart",
@@ -361,6 +465,7 @@ describe("AcpSessionManager runtime handles", () => {
 
     const manager = new AcpSessionManager();
     await manager.runTurn({
+      provenance: "system",
       cfg: baseCfg,
       sessionKey,
       text: "after restart",
@@ -397,6 +502,7 @@ describe("AcpSessionManager runtime handles", () => {
 
     const manager = new AcpSessionManager();
     await manager.runTurn({
+      provenance: "system",
       cfg: baseCfg,
       sessionKey,
       text: "after restart",
@@ -433,6 +539,7 @@ describe("AcpSessionManager runtime handles", () => {
 
     const manager = new AcpSessionManager();
     await manager.runTurn({
+      provenance: "system",
       cfg: baseCfg,
       sessionKey,
       text: "after restart",
@@ -474,6 +581,7 @@ describe("AcpSessionManager runtime handles", () => {
 
     const manager = new AcpSessionManager();
     await manager.runTurn({
+      provenance: "system",
       cfg: baseCfg,
       sessionKey,
       text: "after restart",
@@ -562,6 +670,7 @@ describe("AcpSessionManager runtime handles", () => {
 
     const manager = new AcpSessionManager();
     await manager.runTurn({
+      provenance: "system",
       cfg: baseCfg,
       sessionKey,
       text: "after restart",

@@ -6,8 +6,16 @@ import path from "node:path";
 import { describe, expect, test } from "vitest";
 import { WebSocket } from "ws";
 import { ConnectErrorDetailCodes } from "../../packages/gateway-protocol/src/connect-error-details.js";
-import { loadOrCreateDeviceIdentity } from "../infra/device-identity.js";
-import { approveNodePairing, listNodePairing, requestNodePairing } from "../infra/node-pairing.js";
+import {
+  loadOrCreateDeviceIdentity,
+  publicKeyRawBase64UrlFromPem,
+} from "../infra/device-identity.js";
+import {
+  approveNodePairing,
+  listNodePairing,
+  requestNodePairing,
+} from "../infra/device-pairing-node.js";
+import { approveDevicePairing, requestDevicePairing } from "../infra/device-pairing.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
 import {
   connectReq,
@@ -65,7 +73,18 @@ async function attemptNodePairing(
 }
 
 async function approveNodeIdentity(params: { identityPath: string; caps: string[] }) {
-  const identity = loadOrCreateDeviceIdentity(params.identityPath);
+  const identity = loadOrCreateDeviceIdentity({ path: params.identityPath });
+  // Node surfaces attach to paired devices, so device pairing comes first.
+  // The stored key must match what the reconnect presents or the handshake
+  // restarts pairing and burns the rate-limit budget under test.
+  const devicePairing = await requestDevicePairing({
+    deviceId: identity.deviceId,
+    publicKey: publicKeyRawBase64UrlFromPem(identity.publicKeyPem),
+    role: "node",
+    roles: ["node"],
+    scopes: [],
+  });
+  await approveDevicePairing(devicePairing.request.requestId, { callerScopes: [] });
   const request = await requestNodePairing({
     nodeId: identity.deviceId,
     platform: NODE_CLIENT.platform,
@@ -97,7 +116,7 @@ describe("node pairing rate limit", () => {
       const responses = await Promise.all(
         Array.from(
           { length: 8 },
-          async (_, index) => await attemptNodePairing(port, `${identityPrefix}-${index}.json`),
+          async (_, index) => await attemptNodePairing(port, `${identityPrefix}-${index}.sqlite`),
         ),
       );
       const rateLimited = responses.filter((res) => {
@@ -131,7 +150,7 @@ describe("node pairing rate limit", () => {
         os.tmpdir(),
         `openclaw-node-pairing-upgrade-${randomUUID()}`,
       );
-      const pairedIdentityPath = `${identityPrefix}-paired.json`;
+      const pairedIdentityPath = `${identityPrefix}-paired.sqlite`;
       const pairedIdentity = await approveNodeIdentity({
         identityPath: pairedIdentityPath,
         caps: ["camera"],
@@ -140,7 +159,7 @@ describe("node pairing rate limit", () => {
       const firstTimeResponses = await Promise.all(
         Array.from(
           { length: 3 },
-          async (_, index) => await attemptNodePairing(port, `${identityPrefix}-${index}.json`),
+          async (_, index) => await attemptNodePairing(port, `${identityPrefix}-${index}.sqlite`),
         ),
       );
       expect(firstTimeResponses.filter((res) => res.ok)).toHaveLength(3);
@@ -188,7 +207,10 @@ describe("node pairing rate limit", () => {
       },
     };
     await withGatewayServer(async ({ port }) => {
-      const identityPath = path.join(os.tmpdir(), `openclaw-node-reapproval-${randomUUID()}.json`);
+      const identityPath = path.join(
+        os.tmpdir(),
+        `openclaw-node-reapproval-${randomUUID()}.sqlite`,
+      );
       const identity = await approveNodeIdentity({ identityPath, caps: ["camera"] });
 
       const responses = await Promise.all(

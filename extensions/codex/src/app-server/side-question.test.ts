@@ -1,5 +1,8 @@
 // Codex tests cover side question plugin behavior.
-import { nativeHookRelayTesting } from "openclaw/plugin-sdk/agent-harness-runtime";
+import {
+  nativeHookRelayTesting,
+  type NativeHookRelayRegistrationHandle,
+} from "openclaw/plugin-sdk/agent-harness-runtime";
 import {
   onInternalDiagnosticEvent,
   resetDiagnosticEventsForTest,
@@ -11,7 +14,18 @@ import {
 } from "openclaw/plugin-sdk/hook-runtime";
 import { createMockPluginRegistry } from "openclaw/plugin-sdk/plugin-test-runtime";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { CodexServerNotification, JsonObject, RpcRequest } from "./protocol.js";
+import {
+  codexTestTurnIds,
+  createFakeCodexAppServerClient,
+} from "./codex-app-server.test-fixtures.js";
+import { resolveCodexSupervisionAppServerRuntimeOptions } from "./config.js";
+import { buildCodexAppServerConnectionFingerprint } from "./plugin-app-cache-key.js";
+import type { CodexServerNotification, JsonObject, JsonValue } from "./protocol.js";
+import {
+  createCodexTestBindingStore,
+  type CodexAppServerBindingStore,
+} from "./session-binding.test-helpers.js";
+import { createClientHarness } from "./test-support.js";
 
 const readCodexAppServerBindingMock = vi.fn();
 const isCodexAppServerNativeAuthProfileMock = vi.fn();
@@ -21,13 +35,35 @@ const createOpenClawCodingToolsMock = vi.fn();
 const toolExecuteMock = vi.fn();
 const handleCodexAppServerApprovalRequestMock = vi.fn();
 const resolveCodexProviderWebSearchSupportForClientMock = vi.fn();
+type SelectionRetryParams = {
+  lease: { client?: unknown };
+  options: { timeoutMs?: number; abandonSignal?: AbortSignal };
+  run: (
+    client: unknown,
+    requestOptions: { timeoutMs: number; signal?: AbortSignal },
+  ) => Promise<unknown>;
+  onClientChange: (client: unknown) => void;
+};
+const withLeasedCodexAppServerClientStartSelectionRetryMock = vi.fn(
+  async (params: SelectionRetryParams) =>
+    await params.run(params.lease.client, {
+      timeoutMs: params.options.timeoutMs ?? 60_000,
+      signal: params.options.abandonSignal,
+    }),
+);
 
-vi.mock("./session-binding.js", () => ({
-  clearCodexAppServerBinding: vi.fn(),
+function supervisionConnectionFingerprint(): string {
+  return buildCodexAppServerConnectionFingerprint(
+    resolveCodexSupervisionAppServerRuntimeOptions({
+      pluginConfig: { supervision: { enabled: true } },
+    }),
+  );
+}
+
+vi.mock("./session-binding.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./session-binding.js")>()),
   isCodexAppServerNativeAuthProfile: (...args: unknown[]) =>
     isCodexAppServerNativeAuthProfileMock(...args),
-  readCodexAppServerBinding: (...args: unknown[]) => readCodexAppServerBindingMock(...args),
-  writeCodexAppServerBinding: vi.fn(),
 }));
 
 vi.mock("./shared-client.js", () => ({
@@ -35,9 +71,16 @@ vi.mock("./shared-client.js", () => ({
   getLeasedSharedCodexAppServerClient: (...args: unknown[]) =>
     getSharedCodexAppServerClientMock(...args),
   releaseLeasedSharedCodexAppServerClient: vi.fn(),
+  releaseCodexAppServerClientLease: vi.fn((lease: { client?: unknown }) => {
+    lease.client = undefined;
+  }),
+  retireSharedCodexAppServerClientIfCurrent: vi.fn(),
+  withLeasedCodexAppServerClientStartSelectionRetry: (params: SelectionRetryParams) =>
+    withLeasedCodexAppServerClientStartSelectionRetryMock(params),
 }));
 
-vi.mock("./auth-bridge.js", () => ({
+vi.mock("./auth-bridge.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./auth-bridge.js")>()),
   refreshCodexAppServerAuthTokens: (...args: unknown[]) =>
     refreshCodexAppServerAuthTokensMock(...args),
 }));
@@ -56,67 +99,33 @@ vi.mock("openclaw/plugin-sdk/agent-harness", () => ({
   createOpenClawCodingTools: (...args: unknown[]) => createOpenClawCodingToolsMock(...args),
 }));
 
-const { testing, runCodexAppServerSideQuestion } = await import("./side-question.js");
-
-type ServerRequest = Required<Pick<RpcRequest, "id" | "method">> & {
-  params?: RpcRequest["params"];
-};
-type ClientRequest = (
-  method: string,
-  requestParams?: unknown,
-  options?: unknown,
-) => Promise<unknown>;
-
-type FakeClient = {
-  request: ReturnType<typeof vi.fn<ClientRequest>>;
-  addNotificationHandler: ReturnType<typeof vi.fn>;
-  addRequestHandler: ReturnType<typeof vi.fn>;
-  notifications: Array<(notification: CodexServerNotification) => void>;
-  requests: Array<(request: ServerRequest) => unknown>;
-  emit: (notification: CodexServerNotification) => void;
-  handleRequest: (request: ServerRequest) => Promise<unknown>;
+const { runCodexAppServerSideQuestion: runCodexAppServerSideQuestionImpl } =
+  await import("./side-question.js");
+const baseBindingStore = createCodexTestBindingStore();
+const bindingStore: CodexAppServerBindingStore = {
+  ...baseBindingStore,
+  read: async (...args) => await readCodexAppServerBindingMock(...args),
 };
 
-function createFakeClient(): FakeClient {
-  const notifications: FakeClient["notifications"] = [];
-  const requests: FakeClient["requests"] = [];
-  const client: FakeClient = {
-    notifications,
-    requests,
-    request: vi.fn<ClientRequest>(),
-    addNotificationHandler: vi.fn((handler: (notification: CodexServerNotification) => void) => {
-      notifications.push(handler);
-      return () => {
-        const index = notifications.indexOf(handler);
-        if (index >= 0) {
-          notifications.splice(index, 1);
-        }
-      };
-    }),
-    addRequestHandler: vi.fn((handler: FakeClient["requests"][number]) => {
-      requests.push(handler);
-      return () => {
-        const index = requests.indexOf(handler);
-        if (index >= 0) {
-          requests.splice(index, 1);
-        }
-      };
-    }),
-    emit: (notification) => {
-      for (const handler of notifications) {
-        handler(notification);
-      }
+function runCodexAppServerSideQuestion(
+  params: Parameters<typeof runCodexAppServerSideQuestionImpl>[0],
+  options: Omit<Parameters<typeof runCodexAppServerSideQuestionImpl>[1], "bindingStore"> = {},
+) {
+  return runCodexAppServerSideQuestionImpl(params, { ...options, bindingStore });
+}
+
+function createFakeClient() {
+  const fixture = createFakeCodexAppServerClient();
+  const client = Object.assign(fixture.client, {
+    notifications: fixture.notifications,
+    request: fixture.request,
+    requests: fixture.requests,
+    emit: (notification: CodexServerNotification) => {
+      void fixture.notify(notification);
     },
-    handleRequest: async (request) => {
-      for (const handler of requests) {
-        const result = await handler(request);
-        if (result !== undefined) {
-          return result;
-        }
-      }
-      return undefined;
-    },
-  };
+    handleRequest: (request: Parameters<typeof fixture.handleServerRequest>[0]) =>
+      fixture.handleServerRequest(request),
+  });
   client.request.mockImplementation(async (method: string) => {
     if (method === "thread/fork") {
       return threadResult("side-thread");
@@ -236,7 +245,7 @@ function threadResult(threadId: string) {
       status: { type: "idle" },
       path: null,
       cwd: "/tmp/workspace",
-      cliVersion: "0.125.0",
+      cliVersion: "0.147.0",
       source: "unknown",
       agentNickname: null,
       agentRole: null,
@@ -294,17 +303,33 @@ function turnCompleted(threadId: string, turnId: string, text: string): CodexSer
   };
 }
 
-function turnCompletedWithNestedThread(
-  threadId: string,
-  turnId: string,
-  text: string,
-): CodexServerNotification {
-  const notification = turnCompleted(threadId, turnId, text);
-  const turn = (notification.params as JsonObject).turn;
-  return { method: notification.method, params: { threadId: "parent-thread", turn } };
+function nativeCommandItem(
+  id: string,
+  status: "inProgress" | "completed",
+  durationMs: number | null,
+) {
+  return {
+    type: "commandExecution",
+    id,
+    command: "git status --short",
+    cwd: "/tmp/workspace",
+    processId: null,
+    source: "agent",
+    status,
+    commandActions: [],
+    aggregatedOutput: status === "completed" ? "" : null,
+    exitCode: status === "completed" ? 0 : null,
+    durationMs,
+  };
 }
 
 function sideParams(overrides: Partial<Parameters<typeof runCodexAppServerSideQuestion>[0]> = {}) {
+  const authProfileId = Object.hasOwn(overrides, "authProfileId")
+    ? overrides.authProfileId
+    : "openai:work";
+  const authProfileIdSource = Object.hasOwn(overrides, "authProfileIdSource")
+    ? overrides.authProfileIdSource
+    : "user";
   return {
     cfg: {} as never,
     agentDir: "/tmp/agent",
@@ -322,10 +347,69 @@ function sideParams(overrides: Partial<Parameters<typeof runCodexAppServerSideQu
     sessionId: "session-1",
     sessionFile: "/tmp/session-1.jsonl",
     workspaceDir: "/tmp/workspace",
-    authProfileId: "openai:work",
-    authProfileIdSource: "user",
+    authProfileId,
+    authProfileIdSource,
+    preparedRuntimeAuth: {
+      plan: {
+        providerForAuth: "openai",
+        authProfileProviderForAuth: "openai",
+        forwardedAuthProfileId: authProfileId,
+        forwardedAuthProfileSource: authProfileId ? authProfileIdSource : undefined,
+        forwardedAuthProfileCandidateIds: authProfileId ? [authProfileId] : undefined,
+        selectedAuthMode: authProfileId ? "token" : undefined,
+        modelRoute: {
+          provider: "openai",
+          modelId: "gpt-5.5",
+          api: "openai-chatgpt-responses",
+          baseUrl: "https://chatgpt.com/backend-api/codex",
+          authRequirement: "subscription",
+          requestTransportOverrides: "none",
+        },
+      },
+      authProfileStore: {
+        version: 1,
+        profiles: authProfileId
+          ? {
+              [authProfileId]: {
+                type: "token",
+                provider: "openai",
+                token: "test-token",
+                expires: Date.now() + 60_000,
+              },
+            }
+          : {},
+      },
+      authStorage: {} as never,
+      modelRegistry: {} as never,
+    },
     ...overrides,
   } satisfies Parameters<typeof runCodexAppServerSideQuestion>[0];
+}
+
+function platformPreparedRuntimeAuth(resolvedApiKey?: string) {
+  return {
+    plan: {
+      providerForAuth: "openai",
+      authProfileProviderForAuth: "openai",
+      selectedAuthMode: "api-key",
+      modelRoute: {
+        provider: "openai",
+        modelId: "gpt-5.6",
+        api: "openai-responses",
+        baseUrl: "https://api.openai.com/v1",
+        authRequirement: "api-key",
+        requestTransportOverrides: "none",
+      },
+    },
+    authProfileStore: {
+      version: 1 as const,
+      profiles: {},
+      order: { openai: [] },
+    },
+    authStorage: {} as never,
+    modelRegistry: {} as never,
+    ...(resolvedApiKey ? { resolvedApiKey } : {}),
+  } satisfies Parameters<typeof runCodexAppServerSideQuestion>[0]["preparedRuntimeAuth"];
 }
 
 async function runSideQuestionWithManagedWebSearchCall(
@@ -358,8 +442,7 @@ async function runSideQuestionWithManagedWebSearchCall(
             id: 42,
             method: "item/tool/call",
             params: {
-              threadId: "side-thread",
-              turnId: "turn-1",
+              ...codexTestTurnIds("side-thread"),
               callId: "tool-1",
               tool: "web_search",
               arguments: { query: "service providers" },
@@ -394,6 +477,14 @@ describe("runCodexAppServerSideQuestion", () => {
     toolExecuteMock.mockReset();
     handleCodexAppServerApprovalRequestMock.mockReset();
     resolveCodexProviderWebSearchSupportForClientMock.mockReset();
+    withLeasedCodexAppServerClientStartSelectionRetryMock.mockReset();
+    withLeasedCodexAppServerClientStartSelectionRetryMock.mockImplementation(
+      async (params: SelectionRetryParams) =>
+        await params.run(params.lease.client, {
+          timeoutMs: params.options.timeoutMs ?? 60_000,
+          signal: params.options.abandonSignal,
+        }),
+    );
     resolveCodexProviderWebSearchSupportForClientMock.mockResolvedValue("supported");
 
     toolExecuteMock.mockResolvedValue({
@@ -439,6 +530,7 @@ describe("runCodexAppServerSideQuestion", () => {
     nativeHookRelayTesting.clearNativeHookRelaysForTests();
     resetDiagnosticEventsForTest();
     resetGlobalHookRunner();
+    vi.useRealTimers();
   });
 
   it("forks an ephemeral side thread and returns the completed assistant text", async () => {
@@ -449,8 +541,11 @@ describe("runCodexAppServerSideQuestion", () => {
       sideParams({
         messageChannel: "discord",
         messageProvider: "discord-voice",
+        chatId: "discord-native-room",
+        chatType: "channel",
         sessionKey: "agent:main:conversation",
         sandboxSessionKey: "agent:main:runtime-policy",
+        messageActionTurnCapability: "turn-capability-1",
         currentChannelId: "voice-room",
         agentAccountId: "account-1",
         messageTo: "channel-1",
@@ -468,6 +563,16 @@ describe("runCodexAppServerSideQuestion", () => {
     );
 
     expect(result).toEqual({ text: "Side answer." });
+    expect(mockCall(getSharedCodexAppServerClientMock)[0]).toMatchObject({
+      preparedAuth: {
+        kind: "profile",
+        profileId: "openai:work",
+        store: expect.objectContaining({
+          profiles: expect.objectContaining({ "openai:work": expect.any(Object) }),
+        }),
+      },
+    });
+    expect(mockCall(getSharedCodexAppServerClientMock)[0]).not.toHaveProperty("authProfileId");
     const forkCall = mockCall(client.request);
     expect(forkCall?.[0]).toBe("thread/fork");
     const forkParams = forkCall?.[1] as Record<string, unknown> | undefined;
@@ -479,14 +584,13 @@ describe("runCodexAppServerSideQuestion", () => {
       "developerInstructions",
       "ephemeral",
       "model",
-      "personality",
       "sandbox",
       "threadId",
       "threadSource",
     ]);
     expect(forkParams?.threadId).toBe("parent-thread");
     expect(forkParams?.model).toBe("gpt-5.5");
-    expect(forkParams?.personality).toBe("none");
+    expect(forkParams).not.toHaveProperty("personality");
     expect(forkParams?.approvalPolicy).toBe("on-request");
     expect(forkParams?.sandbox).toBe("workspace-write");
     expect(forkParams?.ephemeral).toBe(true);
@@ -494,6 +598,7 @@ describe("runCodexAppServerSideQuestion", () => {
     expect(forkParams?.approvalsReviewer).toBe("user");
     expect(forkParams?.cwd).toBe("/tmp/workspace");
     expect(forkParams?.config).toEqual({
+      "features.goals": false,
       "features.code_mode": true,
       "features.code_mode_only": false,
       "features.apply_patch_streaming_events": true,
@@ -565,7 +670,9 @@ describe("runCodexAppServerSideQuestion", () => {
     expect(toolOptions).toHaveProperty("modelId", "gpt-5.5");
     expect(toolOptions).toHaveProperty("messageProvider", "discord");
     expect(toolOptions).toHaveProperty("toolPolicyMessageProvider", "discord-voice");
+    expect(toolOptions).toHaveProperty("chatType", "channel");
     expect(toolOptions).toHaveProperty("currentChannelId", "voice-room");
+    expect(toolOptions).toHaveProperty("nativeChannelId", "discord-native-room");
     expect(toolOptions).toMatchObject({
       agentAccountId: "account-1",
       sessionKey: "agent:main:runtime-policy",
@@ -581,8 +688,387 @@ describe("runCodexAppServerSideQuestion", () => {
       senderUsername: "rosita",
       senderE164: "+15550001",
       senderIsOwner: true,
+      messageActionTurnCapability: "turn-capability-1",
     });
     expect(toolOptions).toHaveProperty("requireExplicitMessageTarget", true);
+  });
+
+  it("rebinds side-question handlers when selection retry replaces the client", async () => {
+    const initialClient = createFakeClient();
+    const replacementClient = createFakeClient();
+    replacementClient.request.mockImplementation(async (method: string) => {
+      if (method === "thread/fork") {
+        expect(initialClient.notifications).toHaveLength(1);
+        expect(initialClient.requests).toHaveLength(1);
+        expect(replacementClient.notifications).toHaveLength(2);
+        expect(replacementClient.requests).toHaveLength(2);
+        return threadResult("side-thread");
+      }
+      if (method === "thread/inject_items") {
+        return {};
+      }
+      if (method === "turn/start") {
+        queueMicrotask(() => {
+          replacementClient.emit(agentDelta("side-thread", "turn-1", "Replacement answer."));
+          replacementClient.emit(turnCompleted("side-thread", "turn-1", "Replacement answer."));
+        });
+        return turnStartResult("turn-1");
+      }
+      if (method === "thread/unsubscribe" || method === "turn/interrupt") {
+        return {};
+      }
+      throw new Error(`unexpected request: ${method}`);
+    });
+    getSharedCodexAppServerClientMock.mockResolvedValue(initialClient);
+    withLeasedCodexAppServerClientStartSelectionRetryMock.mockImplementationOnce(
+      async (params: SelectionRetryParams) => {
+        expect(params.lease.client).toBe(initialClient);
+        params.lease.client = replacementClient;
+        params.onClientChange(replacementClient);
+        return await params.run(replacementClient, {
+          timeoutMs: params.options.timeoutMs ?? 60_000,
+          signal: params.options.abandonSignal,
+        });
+      },
+    );
+
+    await expect(runCodexAppServerSideQuestion(sideParams())).resolves.toEqual({
+      text: "Replacement answer.",
+    });
+
+    // Only the physical-client runtime observers remain after side-question cleanup.
+    expect(initialClient.notifications).toHaveLength(1);
+    expect(initialClient.requests).toHaveLength(1);
+    expect(replacementClient.notifications).toHaveLength(1);
+    expect(replacementClient.requests).toHaveLength(1);
+  });
+
+  it("rejects a Platform plan before binding OAuth can fill missing prepared auth", async () => {
+    await expect(
+      runCodexAppServerSideQuestion(
+        sideParams({
+          provider: "openai",
+          model: "gpt-5.6",
+          runtimeModel: {
+            provider: "openai",
+            id: "gpt-5.6",
+            api: "openai-responses",
+            baseUrl: "https://api.openai.com/v1",
+          } as never,
+          authProfileId: undefined,
+          authProfileIdSource: undefined,
+          preparedRuntimeAuth: platformPreparedRuntimeAuth(),
+        }),
+      ),
+    ).rejects.toThrow("Prepared Codex API-key route is missing its resolved API key");
+
+    expect(getSharedCodexAppServerClientMock).not.toHaveBeenCalled();
+    expect(isCodexAppServerNativeAuthProfileMock).not.toHaveBeenCalled();
+  });
+
+  it("rejects an unprofiled subscription plan before native account inference", async () => {
+    isCodexAppServerNativeAuthProfileMock.mockReturnValue(false);
+    await expect(
+      runCodexAppServerSideQuestion(
+        sideParams({
+          authProfileId: undefined,
+          authProfileIdSource: undefined,
+        }),
+      ),
+    ).rejects.toThrow(
+      "Prepared Codex subscription route requires a scoped native OAuth or token profile",
+    );
+
+    expect(getSharedCodexAppServerClientMock).not.toHaveBeenCalled();
+    expect(isCodexAppServerNativeAuthProfileMock).toHaveBeenCalledWith(
+      expect.objectContaining({ authProfileId: undefined, authProfileStore: expect.any(Object) }),
+    );
+  });
+
+  it("rejects an API-key profile for a prepared subscription route", async () => {
+    isCodexAppServerNativeAuthProfileMock.mockReturnValue(false);
+    const params = sideParams();
+    params.preparedRuntimeAuth.authProfileStore.profiles["openai:work"] = {
+      type: "api_key",
+      provider: "openai",
+      key: "platform-key",
+    };
+
+    await expect(runCodexAppServerSideQuestion(params)).rejects.toThrow(
+      "Prepared Codex subscription route requires a scoped native OAuth or token profile",
+    );
+    expect(isCodexAppServerNativeAuthProfileMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        authProfileId: "openai:work",
+        authProfileStore: params.preparedRuntimeAuth.authProfileStore,
+      }),
+    );
+    expect(getSharedCodexAppServerClientMock).not.toHaveBeenCalled();
+  });
+
+  it("starts a Platform side question with only its authoritative prepared API key", async () => {
+    const client = createFakeClient();
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+    isCodexAppServerNativeAuthProfileMock.mockReturnValue(false);
+    const preparedRuntimeAuth = platformPreparedRuntimeAuth("platform-key");
+
+    await expect(
+      runCodexAppServerSideQuestion(
+        sideParams({
+          provider: "openai",
+          model: "gpt-5.6",
+          runtimeModel: {
+            provider: "openai",
+            id: "gpt-5.6",
+            api: "openai-responses",
+            baseUrl: "https://api.openai.com/v1",
+          } as never,
+          authProfileId: undefined,
+          authProfileIdSource: undefined,
+          preparedRuntimeAuth,
+        }),
+      ),
+    ).resolves.toEqual({ text: "Side answer." });
+
+    expect(getSharedCodexAppServerClientMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        preparedAuth: { kind: "api-key", apiKey: "platform-key" },
+      }),
+    );
+    expect(mockCall(getSharedCodexAppServerClientMock)[0]).not.toHaveProperty("authProfileId");
+    expect(isCodexAppServerNativeAuthProfileMock).not.toHaveBeenCalledWith(
+      expect.objectContaining({ authProfileId: "openai:work" }),
+    );
+  });
+
+  it("allocates one fallback run ID per side-question invocation", async () => {
+    const client = createFakeClient();
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+
+    await runCodexAppServerSideQuestion(sideParams());
+    await runCodexAppServerSideQuestion(sideParams());
+
+    const runIds = createOpenClawCodingToolsMock.mock.calls.map(
+      ([options]) => (options as { runId: string }).runId,
+    );
+    expect(runIds).toHaveLength(2);
+    expect(runIds[0]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(runIds[1]).toMatch(/^[0-9a-f-]{36}$/);
+    expect(new Set(runIds).size).toBe(2);
+  });
+
+  it("uses the default supervision runtime, native auth, and exact bound model pair", async () => {
+    const client = createFakeClient();
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+    readCodexAppServerBindingMock.mockResolvedValue({
+      threadId: "parent-thread",
+      connectionScope: "supervision",
+      supervisionSourceThreadId: "source-thread",
+      cwd: "/tmp/workspace",
+      model: "gpt-5.5",
+      modelProvider: "openai",
+      appServerRuntimeFingerprint: supervisionConnectionFingerprint(),
+      preserveNativeModel: true,
+      conversationSourceTransferComplete: true,
+    });
+
+    await expect(
+      runCodexAppServerSideQuestion(
+        sideParams({
+          provider: "anthropic",
+          model: "claude-opus-4-6",
+          runtimeModel: {
+            id: "claude-opus-4-6",
+            provider: "anthropic",
+            compat: { supportsTools: false },
+          } as never,
+          authProfileId: "openai:outer",
+        }),
+        { pluginConfig: { supervision: { enabled: true } } },
+      ),
+    ).resolves.toEqual({ text: "Side answer." });
+
+    expect(getSharedCodexAppServerClientMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        authProfileId: null,
+        startOptions: expect.objectContaining({ homeScope: "user" }),
+      }),
+    );
+    const forkCall = client.request.mock.calls.find(([method]) => method === "thread/fork");
+    expect(forkCall?.[1]).toMatchObject({
+      threadId: "parent-thread",
+      model: "gpt-5.5",
+      modelProvider: "openai",
+    });
+    const turnCall = client.request.mock.calls.find(([method]) => method === "turn/start");
+    expect(turnCall?.[1]).toMatchObject({ model: "gpt-5.5" });
+    expect(turnCall?.[1]).not.toHaveProperty("effort");
+    expect(turnCall?.[1]).not.toHaveProperty("collaborationMode");
+    expect(turnCall?.[1]).not.toHaveProperty("personality");
+    expect(createOpenClawCodingToolsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ modelProvider: "openai", modelId: "gpt-5.5" }),
+    );
+  });
+
+  it("rejects an incomplete supervised model pair before selecting a client", async () => {
+    readCodexAppServerBindingMock.mockResolvedValue({
+      threadId: "parent-thread",
+      connectionScope: "supervision",
+      supervisionSourceThreadId: "source-thread",
+      cwd: "/tmp/workspace",
+      model: "gpt-5.5",
+      appServerRuntimeFingerprint: supervisionConnectionFingerprint(),
+      preserveNativeModel: true,
+      conversationSourceTransferComplete: true,
+    });
+
+    await expect(
+      runCodexAppServerSideQuestion(sideParams(), {
+        pluginConfig: { supervision: { enabled: true } },
+      }),
+    ).rejects.toThrow("missing its native model and provider");
+    expect(getSharedCodexAppServerClientMock).not.toHaveBeenCalled();
+  });
+
+  it("cleans up a supervised fork that returns a different native model pair", async () => {
+    const client = createFakeClient();
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+    readCodexAppServerBindingMock.mockResolvedValue({
+      threadId: "parent-thread",
+      connectionScope: "supervision",
+      supervisionSourceThreadId: "source-thread",
+      cwd: "/tmp/workspace",
+      model: "gpt-5.4",
+      modelProvider: "openai",
+      appServerRuntimeFingerprint: supervisionConnectionFingerprint(),
+      preserveNativeModel: true,
+      conversationSourceTransferComplete: true,
+    });
+
+    await expect(
+      runCodexAppServerSideQuestion(sideParams(), {
+        pluginConfig: { supervision: { enabled: true } },
+      }),
+    ).rejects.toThrow("did not preserve its native model and provider");
+
+    expect(client.request.mock.calls.map(([method]) => method)).toEqual([
+      "thread/fork",
+      "thread/unsubscribe",
+    ]);
+    expect(client.request).not.toHaveBeenCalledWith(
+      "thread/inject_items",
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(client.request).not.toHaveBeenCalledWith(
+      "turn/start",
+      expect.anything(),
+      expect.anything(),
+    );
+  });
+
+  it("replays app-scoped reviewer policy into side-thread forks", async () => {
+    const client = createFakeClient();
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+    readCodexAppServerBindingMock.mockResolvedValue({
+      schemaVersion: 2,
+      threadId: "parent-thread",
+      sessionFile: "/tmp/session-1.jsonl",
+      cwd: "/tmp/workspace",
+      authProfileId: "openai:work",
+      model: "gpt-5.5",
+      approvalPolicy: "on-request",
+      sandbox: "workspace-write",
+      pluginAppPolicyContext: {
+        fingerprint: "mixed-plugin-policy",
+        apps: {
+          "ask-app": {
+            configKey: "ask",
+            marketplaceName: "openai",
+            pluginName: "ask",
+            allowDestructiveActions: true,
+            destructiveApprovalMode: "ask",
+            mcpServerNames: ["ask"],
+          },
+          "true-app": {
+            configKey: "true",
+            marketplaceName: "openai",
+            pluginName: "true",
+            allowDestructiveActions: true,
+            destructiveApprovalMode: "allow",
+            mcpServerNames: ["true"],
+          },
+          "false-app": {
+            configKey: "false",
+            marketplaceName: "openai",
+            pluginName: "false",
+            allowDestructiveActions: false,
+            destructiveApprovalMode: "deny",
+            mcpServerNames: ["false"],
+          },
+          "auto-app": {
+            configKey: "auto",
+            marketplaceName: "openai",
+            pluginName: "auto",
+            allowDestructiveActions: true,
+            destructiveApprovalMode: "auto",
+            mcpServerNames: ["auto"],
+          },
+        },
+        pluginAppIds: {
+          ask: ["ask-app"],
+          true: ["true-app"],
+          false: ["false-app"],
+          auto: ["auto-app"],
+        },
+      },
+      createdAt: new Date(0).toISOString(),
+      updatedAt: new Date(0).toISOString(),
+    });
+
+    await expect(
+      runCodexAppServerSideQuestion(sideParams(), {
+        pluginConfig: { appServer: { mode: "guardian" } },
+      }),
+    ).resolves.toEqual({ text: "Side answer." });
+
+    const forkParams = mockCall(client.request)[1] as Record<string, unknown> | undefined;
+    expect(forkParams?.approvalsReviewer).toBe("auto_review");
+    const config = forkParams?.config as Record<string, unknown> | undefined;
+    expect(config).not.toHaveProperty("approvals_reviewer");
+    expect(config?.["features.code_mode"]).toBe(true);
+    expect(config?.apps).toEqual({
+      _default: {
+        enabled: false,
+        destructive_enabled: false,
+        open_world_enabled: false,
+      },
+      "ask-app": {
+        enabled: true,
+        approvals_reviewer: "user",
+        destructive_enabled: true,
+        open_world_enabled: true,
+        default_tools_approval_mode: "auto",
+      },
+      "auto-app": {
+        enabled: true,
+        destructive_enabled: true,
+        open_world_enabled: true,
+        default_tools_approval_mode: "auto",
+      },
+      "false-app": {
+        enabled: true,
+        destructive_enabled: false,
+        open_world_enabled: true,
+        default_tools_approval_mode: "auto",
+      },
+      "true-app": {
+        enabled: true,
+        destructive_enabled: true,
+        open_world_enabled: true,
+        default_tools_approval_mode: "auto",
+      },
+    });
   });
 
   it("disables hosted search when side-question sender policy removes managed web_search", async () => {
@@ -771,33 +1257,6 @@ describe("runCodexAppServerSideQuestion", () => {
     expect(resolveCodexProviderWebSearchSupportForClientMock).not.toHaveBeenCalled();
   });
 
-  it("returns side-thread completions scoped by nested turn thread id", async () => {
-    const client = createFakeClient();
-    client.request.mockImplementation(async (method: string) => {
-      if (method === "thread/fork") {
-        return threadResult("side-thread");
-      }
-      if (method === "thread/inject_items") {
-        return {};
-      }
-      if (method === "turn/start") {
-        queueMicrotask(() =>
-          client.emit(turnCompletedWithNestedThread("side-thread", "turn-1", "Nested answer.")),
-        );
-        return turnStartResult("turn-1");
-      }
-      if (method === "thread/unsubscribe" || method === "turn/interrupt") {
-        return {};
-      }
-      throw new Error(`unexpected request: ${method}`);
-    });
-    getSharedCodexAppServerClientMock.mockResolvedValue(client);
-
-    const result = await runCodexAppServerSideQuestion(sideParams());
-
-    expect(result).toEqual({ text: "Nested answer." });
-  });
-
   it("rejects /btw before forking when the current OpenClaw session is sandboxed", async () => {
     await expect(
       runCodexAppServerSideQuestion(
@@ -922,9 +1381,41 @@ describe("runCodexAppServerSideQuestion", () => {
     const turnStartCall = client.request.mock.calls.find(([method]) => method === "turn/start");
     expect(turnStartCall?.[1]).not.toHaveProperty("config");
     expect(relayIdDuringFork).toBeDefined();
+    expect(createOpenClawCodingToolsMock).toHaveBeenCalledWith(
+      expect.objectContaining({ runId: "run-side-1" }),
+    );
     expect(
       nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(relayIdDuringFork!),
     ).toBeUndefined();
+  });
+
+  it("omits the loop-detection PreToolUse subprocess for side threads when disabled", async () => {
+    const client = createFakeClient();
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+
+    await expect(
+      runCodexAppServerSideQuestion(
+        sideParams({
+          cfg: { tools: { loopDetection: { enabled: true } } } as never,
+          sessionKey: "agent:main:session-1",
+        }),
+        {
+          pluginConfig: {
+            appServer: { loopDetectionPreToolUseRelay: false },
+          },
+          nativeHookRelay: { enabled: true },
+        },
+      ),
+    ).resolves.toEqual({ text: "Side answer." });
+
+    const forkParams = mockCall(client.request)[1] as Record<string, unknown> | undefined;
+    const config = forkParams?.config as Record<string, unknown> | undefined;
+    expect(config?.["features.hooks"]).toBe(true);
+    expect(config?.["hooks.PreToolUse"]).toEqual([]);
+    const hookState = config?.["hooks.state"] as
+      | Record<string, { enabled?: unknown; trusted_hash?: unknown }>
+      | undefined;
+    expect(codexHookStateForEvent(hookState, "pre_tool_use")).toEqual({ enabled: false });
   });
 
   it("forwards side-thread command approvals through the active native hook relay", async () => {
@@ -948,8 +1439,7 @@ describe("runCodexAppServerSideQuestion", () => {
               id: 42,
               method: "item/commandExecution/requestApproval",
               params: {
-                threadId: "side-thread",
-                turnId: "turn-1",
+                ...codexTestTurnIds("side-thread"),
                 itemId: "cmd-side",
                 command: "/bin/bash -lc 'node -v'",
                 cwd: "/tmp/workspace",
@@ -994,14 +1484,12 @@ describe("runCodexAppServerSideQuestion", () => {
     expect(approvalArgs).toMatchObject({
       method: "item/commandExecution/requestApproval",
       requestParams: {
-        threadId: "side-thread",
-        turnId: "turn-1",
+        ...codexTestTurnIds("side-thread"),
         itemId: "cmd-side",
         command: "/bin/bash -lc 'node -v'",
         cwd: "/tmp/workspace",
       },
-      threadId: "side-thread",
-      turnId: "turn-1",
+      ...codexTestTurnIds("side-thread"),
       autoApprove: false,
       paramsForRun: {
         messageChannel: "discord",
@@ -1481,6 +1969,217 @@ describe("runCodexAppServerSideQuestion", () => {
     expect(relayId).toBe(relayIdDuringFork);
   });
 
+  it("emits a buffered native pre-tool failure when side turn startup fails", async () => {
+    const client = createFakeClient();
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribeDiagnostics = onInternalDiagnosticEvent((event) =>
+      diagnosticEvents.push(event),
+    );
+    let relayId: string | undefined;
+    let reportPreToolUseFailure:
+      | NonNullable<NativeHookRelayRegistrationHandle["onPreToolUseFailure"]>
+      | undefined;
+    client.request.mockImplementation(async (method: string, requestParams: unknown) => {
+      if (method === "thread/fork") {
+        relayId = extractRelayIdFromThreadConfig(
+          (requestParams as { config?: Record<string, unknown> }).config,
+        );
+        return threadResult("side-thread");
+      }
+      if (method === "thread/inject_items") {
+        return {};
+      }
+      if (method === "turn/start") {
+        if (!relayId) {
+          throw new Error("Expected native hook relay id");
+        }
+        reportPreToolUseFailure =
+          nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(
+            relayId,
+          )?.onPreToolUseFailure;
+        throw new Error("side turn start exploded");
+      }
+      if (method === "thread/unsubscribe" || method === "turn/interrupt") {
+        return {};
+      }
+      throw new Error(`unexpected request: ${method}`);
+    });
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+
+    try {
+      await expect(
+        runCodexAppServerSideQuestion(sideParams(), {
+          nativeHookRelay: { enabled: true },
+        }),
+      ).rejects.toThrow("side turn start exploded");
+      await reportPreToolUseFailure?.({
+        toolName: "exec",
+        toolCallId: "side-turn-start-failure-tool",
+        disposition: "failed",
+        durationMs: 5,
+      });
+      await flushDiagnosticEvents();
+    } finally {
+      unsubscribeDiagnostics();
+    }
+
+    expect(diagnosticEvents).toContainEqual(
+      expect.objectContaining({
+        type: "tool.execution.error",
+        toolCallId: "side-turn-start-failure-tool",
+        terminalReason: "failed",
+      }),
+    );
+  });
+
+  it("preserves a late native pre-tool failure after side turn cleanup", async () => {
+    const client = createFakeClient();
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribeDiagnostics = onInternalDiagnosticEvent((event) =>
+      diagnosticEvents.push(event),
+    );
+    let reportPreToolUseFailure:
+      | NonNullable<NativeHookRelayRegistrationHandle["onPreToolUseFailure"]>
+      | undefined;
+    client.request.mockImplementation(async (method: string, requestParams: unknown) => {
+      if (method === "thread/fork") {
+        const relayId = extractRelayIdFromThreadConfig(
+          (requestParams as { config?: Record<string, unknown> }).config,
+        );
+        reportPreToolUseFailure =
+          nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(
+            relayId,
+          )?.onPreToolUseFailure;
+        return threadResult("side-thread");
+      }
+      if (method === "thread/inject_items") {
+        return {};
+      }
+      if (method === "turn/start") {
+        queueMicrotask(() => {
+          client.emit(agentDelta("side-thread", "turn-1", "Side answer."));
+          client.emit(turnCompleted("side-thread", "turn-1", "Side answer."));
+        });
+        return turnStartResult("turn-1");
+      }
+      if (method === "thread/unsubscribe" || method === "turn/interrupt") {
+        return {};
+      }
+      throw new Error(`unexpected request: ${method}`);
+    });
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+
+    try {
+      await expect(
+        runCodexAppServerSideQuestion(sideParams(), {
+          nativeHookRelay: { enabled: true },
+        }),
+      ).resolves.toEqual({ text: "Side answer." });
+      await reportPreToolUseFailure?.({
+        toolName: "exec",
+        toolCallId: "late-side-tool",
+        disposition: "failed",
+        durationMs: 5,
+      });
+      await flushDiagnosticEvents();
+    } finally {
+      unsubscribeDiagnostics();
+    }
+
+    expect(diagnosticEvents).toContainEqual(
+      expect.objectContaining({
+        type: "tool.execution.error",
+        toolCallId: "late-side-tool",
+        terminalReason: "failed",
+      }),
+    );
+  });
+
+  it("coalesces a native pre-tool failure that arrives during side turn cleanup", async () => {
+    const client = createFakeClient();
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribeDiagnostics = onInternalDiagnosticEvent((event) =>
+      diagnosticEvents.push(event),
+    );
+    let reportPreToolUseFailure:
+      | NonNullable<NativeHookRelayRegistrationHandle["onPreToolUseFailure"]>
+      | undefined;
+    client.request.mockImplementation(async (method: string, requestParams: unknown) => {
+      if (method === "thread/fork") {
+        const relayId = extractRelayIdFromThreadConfig(
+          (requestParams as { config?: Record<string, unknown> }).config,
+        );
+        reportPreToolUseFailure =
+          nativeHookRelayTesting.getNativeHookRelayRegistrationForTests(
+            relayId,
+          )?.onPreToolUseFailure;
+        return threadResult("side-thread");
+      }
+      if (method === "thread/inject_items") {
+        return {};
+      }
+      if (method === "turn/start") {
+        queueMicrotask(() => {
+          client.emit({
+            method: "item/started",
+            params: {
+              ...codexTestTurnIds("side-thread"),
+              item: nativeCommandItem("side-cleanup-failure-tool", "inProgress", null),
+            },
+          });
+          client.emit(turnCompleted("side-thread", "turn-1", "Side answer."));
+        });
+        return turnStartResult("turn-1");
+      }
+      if (method === "thread/unsubscribe") {
+        await reportPreToolUseFailure?.({
+          toolName: "exec",
+          toolCallId: "side-cleanup-failure-tool",
+          disposition: "failed",
+          durationMs: 5,
+        });
+        return {};
+      }
+      if (method === "turn/interrupt") {
+        return {};
+      }
+      throw new Error(`unexpected request: ${method}`);
+    });
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+
+    try {
+      await expect(
+        runCodexAppServerSideQuestion(sideParams(), {
+          nativeHookRelay: { enabled: true },
+        }),
+      ).resolves.toEqual({ text: "Side answer." });
+      await flushDiagnosticEvents();
+    } finally {
+      unsubscribeDiagnostics();
+    }
+
+    expect(
+      diagnosticEvents.filter(
+        (event) =>
+          event.type.startsWith("tool.execution.") &&
+          "toolCallId" in event &&
+          event.toolCallId === "side-cleanup-failure-tool",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        type: "tool.execution.started",
+        toolCallId: "side-cleanup-failure-tool",
+      }),
+      expect.objectContaining({
+        type: "tool.execution.error",
+        toolCallId: "side-cleanup-failure-tool",
+        errorCategory: "before_tool_call",
+        terminalReason: "failed",
+      }),
+    ]);
+    expect(activeDiagnosticToolKeys(diagnosticEvents)).toEqual(new Set());
+  });
+
   it("bridges side-thread dynamic tool requests to OpenClaw tools", async () => {
     const client = createFakeClient();
     let toolResponse: unknown;
@@ -1498,8 +2197,7 @@ describe("runCodexAppServerSideQuestion", () => {
               id: 42,
               method: "item/tool/call",
               params: {
-                threadId: "side-thread",
-                turnId: "turn-1",
+                ...codexTestTurnIds("side-thread"),
                 callId: "tool-1",
                 tool: "wiki_status",
                 arguments: { topic: "AGENTS.md" },
@@ -1533,6 +2231,131 @@ describe("runCodexAppServerSideQuestion", () => {
     });
   });
 
+  it("omits computer control from side threads without a compaction owner", async () => {
+    const client = createFakeClient();
+    const computerExecute = vi.fn();
+    let toolResponse: unknown;
+    createOpenClawCodingToolsMock.mockReturnValue([
+      {
+        name: "computer",
+        description: "Control a desktop",
+        parameters: { type: "object", properties: {} },
+        execute: computerExecute,
+      },
+    ]);
+    client.request.mockImplementation(async (method: string) => {
+      if (method === "thread/fork") {
+        return threadResult("side-thread");
+      }
+      if (method === "thread/inject_items") {
+        return {};
+      }
+      if (method === "turn/start") {
+        setTimeout(() => {
+          void (async () => {
+            toolResponse = await client.handleRequest({
+              id: 43,
+              method: "item/tool/call",
+              params: {
+                ...codexTestTurnIds("side-thread"),
+                callId: "computer-1",
+                tool: "computer",
+                arguments: { action: "screenshot" },
+              },
+            });
+            client.emit(agentDelta("side-thread", "turn-1", "Side answer."));
+            client.emit(turnCompleted("side-thread", "turn-1", "Side answer."));
+          })();
+        }, 0);
+        return turnStartResult("turn-1");
+      }
+      if (method === "thread/unsubscribe" || method === "turn/interrupt") {
+        return {};
+      }
+      throw new Error(`unexpected request: ${method}`);
+    });
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+
+    await expect(runCodexAppServerSideQuestion(sideParams())).resolves.toEqual({
+      text: "Side answer.",
+    });
+    expect(computerExecute).not.toHaveBeenCalled();
+    expect(toolResponse).toEqual({
+      success: false,
+      contentItems: [{ type: "inputText", text: "Unknown OpenClaw tool: computer" }],
+    });
+  });
+
+  it("aborts active side tools before waiting for thread cleanup", async () => {
+    const client = createFakeClient();
+    let releaseUnsubscribe: (() => void) | undefined;
+    const unsubscribePending = new Promise<void>((resolve) => {
+      releaseUnsubscribe = resolve;
+    });
+    let toolAborted = false;
+    let resolveToolStarted: (() => void) | undefined;
+    const toolStarted = new Promise<void>((resolve) => {
+      resolveToolStarted = resolve;
+    });
+    toolExecuteMock.mockImplementation(
+      (_callId: string, _args: unknown, signal?: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          resolveToolStarted?.();
+          signal?.addEventListener(
+            "abort",
+            () => {
+              toolAborted = true;
+              reject(new Error("side tool aborted"));
+            },
+            { once: true },
+          );
+        }),
+    );
+    client.request.mockImplementation(async (method: string) => {
+      if (method === "thread/fork") {
+        return threadResult("side-thread");
+      }
+      if (method === "thread/inject_items") {
+        return {};
+      }
+      if (method === "turn/start") {
+        setTimeout(() => {
+          void (async () => {
+            void client.handleRequest({
+              id: 42,
+              method: "item/tool/call",
+              params: {
+                ...codexTestTurnIds("side-thread"),
+                callId: "tool-1",
+                tool: "wiki_status",
+                arguments: {},
+              },
+            });
+            await toolStarted;
+            client.emit(turnCompleted("side-thread", "turn-1", "Finished answer."));
+          })();
+        }, 0);
+        return turnStartResult("turn-1");
+      }
+      if (method === "thread/unsubscribe") {
+        await unsubscribePending;
+        return {};
+      }
+      throw new Error(`unexpected request: ${method}`);
+    });
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+
+    const run = runCodexAppServerSideQuestion(sideParams());
+    await vi.waitFor(() =>
+      expect(client.request.mock.calls.some(([method]) => method === "thread/unsubscribe")).toBe(
+        true,
+      ),
+    );
+    expect(toolAborted).toBe(true);
+    releaseUnsubscribe?.();
+    await expect(run).resolves.toEqual({ text: "Finished answer." });
+  });
+
   it("clears side-thread dynamic tool diagnostics at the app-server request boundary", async () => {
     const client = createFakeClient();
     const diagnosticEvents: DiagnosticEventPayload[] = [];
@@ -1553,8 +2376,7 @@ describe("runCodexAppServerSideQuestion", () => {
               id: 42,
               method: "item/tool/call",
               params: {
-                threadId: "side-thread",
-                turnId: "turn-1",
+                ...codexTestTurnIds("side-thread"),
                 callId: "tool-1",
                 tool: "wiki_status",
                 arguments: { topic: "AGENTS.md" },
@@ -1610,6 +2432,405 @@ describe("runCodexAppServerSideQuestion", () => {
     expect(activeDiagnosticToolKeys(diagnosticEvents)).toEqual(new Set());
   });
 
+  it("projects native side-thread tool notifications into trusted diagnostics", async () => {
+    const client = createFakeClient();
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribeDiagnostics = onInternalDiagnosticEvent((event) =>
+      diagnosticEvents.push(event),
+    );
+    client.request.mockImplementation(async (method: string) => {
+      if (method === "thread/fork") {
+        return threadResult("side-thread");
+      }
+      if (method === "thread/inject_items") {
+        return {};
+      }
+      if (method === "turn/start") {
+        setTimeout(() => {
+          client.emit({
+            method: "item/started",
+            params: {
+              ...codexTestTurnIds("side-thread"),
+              item: nativeCommandItem("native-tool-1", "inProgress", null),
+            },
+          });
+          client.emit({
+            method: "item/completed",
+            params: {
+              ...codexTestTurnIds("side-thread"),
+              item: nativeCommandItem("native-tool-1", "completed", 12),
+            },
+          });
+          const webSearchItem = {
+            type: "webSearch",
+            id: "native-search-1",
+            query: "sensitive side-thread query",
+            action: {
+              type: "search",
+              query: "sensitive side-thread query",
+              queries: null,
+            },
+          };
+          client.emit({
+            method: "item/started",
+            params: { threadId: "side-thread", turnId: "turn-1", item: webSearchItem },
+          });
+          client.emit({
+            method: "item/completed",
+            params: { threadId: "side-thread", turnId: "turn-1", item: webSearchItem },
+          });
+          client.emit(turnCompleted("side-thread", "turn-1", "Native tool answer."));
+        }, 0);
+        return turnStartResult("turn-1");
+      }
+      if (method === "thread/unsubscribe" || method === "turn/interrupt") {
+        return {};
+      }
+      throw new Error(`unexpected request: ${method}`);
+    });
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+
+    try {
+      await runCodexAppServerSideQuestion(
+        sideParams({
+          agentId: "side-agent",
+          sessionKey: "agent:side-agent:main",
+          opts: { runId: "run-side-native-tool" },
+        }),
+      );
+      await flushDiagnosticEvents();
+    } finally {
+      unsubscribeDiagnostics();
+    }
+
+    type ToolExecutionEvent = Extract<
+      DiagnosticEventPayload,
+      {
+        type:
+          | "tool.execution.started"
+          | "tool.execution.completed"
+          | "tool.execution.error"
+          | "tool.execution.blocked";
+      }
+    >;
+    const toolEvents = diagnosticEvents.filter((event): event is ToolExecutionEvent =>
+      event.type.startsWith("tool.execution."),
+    );
+    expect(
+      toolEvents.map((event) => ({
+        type: event.type,
+        agentId: event.agentId,
+        toolName: "toolName" in event ? event.toolName : undefined,
+        toolCallId: "toolCallId" in event ? event.toolCallId : undefined,
+        durationMs: "durationMs" in event ? event.durationMs : undefined,
+      })),
+    ).toEqual([
+      {
+        type: "tool.execution.started",
+        agentId: "side-agent",
+        toolName: "bash",
+        toolCallId: "native-tool-1",
+        durationMs: undefined,
+      },
+      {
+        type: "tool.execution.completed",
+        agentId: "side-agent",
+        toolName: "bash",
+        toolCallId: "native-tool-1",
+        durationMs: 12,
+      },
+      {
+        type: "tool.execution.started",
+        agentId: "side-agent",
+        toolName: "web_search",
+        toolCallId: "native-search-1",
+        durationMs: undefined,
+      },
+      {
+        type: "tool.execution.error",
+        agentId: "side-agent",
+        toolName: "web_search",
+        toolCallId: "native-search-1",
+        durationMs: expect.any(Number),
+      },
+    ]);
+    expect(toolEvents.at(-1)).toMatchObject({
+      errorCode: "tool_outcome_unknown",
+      terminalReason: "failed",
+    });
+    expect(activeDiagnosticToolKeys(diagnosticEvents)).toEqual(new Set());
+    expect(JSON.stringify(toolEvents)).not.toContain("sensitive side-thread query");
+  });
+
+  it("keeps cleanup-only aborts out of unfinished native tool outcomes", async () => {
+    const client = createFakeClient();
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribeDiagnostics = onInternalDiagnosticEvent((event) =>
+      diagnosticEvents.push(event),
+    );
+    client.request.mockImplementation(async (method: string) => {
+      if (method === "thread/fork") {
+        return threadResult("side-thread");
+      }
+      if (method === "thread/inject_items") {
+        return {};
+      }
+      if (method === "turn/start") {
+        setTimeout(() => {
+          client.emit({
+            method: "item/started",
+            params: {
+              ...codexTestTurnIds("side-thread"),
+              item: nativeCommandItem("native-tool-unfinished", "inProgress", null),
+            },
+          });
+          client.emit(turnCompleted("side-thread", "turn-1", "Native tool answer."));
+        }, 0);
+        return turnStartResult("turn-1");
+      }
+      if (method === "thread/unsubscribe" || method === "turn/interrupt") {
+        return {};
+      }
+      throw new Error(`unexpected request: ${method}`);
+    });
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+
+    try {
+      await runCodexAppServerSideQuestion(
+        sideParams({
+          agentId: "side-agent",
+          sessionKey: "agent:side-agent:main",
+          opts: { runId: "run-side-native-unfinished" },
+        }),
+      );
+      await flushDiagnosticEvents();
+    } finally {
+      unsubscribeDiagnostics();
+    }
+
+    expect(
+      diagnosticEvents.filter(
+        (event) =>
+          event.type.startsWith("tool.execution.") &&
+          "toolCallId" in event &&
+          event.toolCallId === "native-tool-unfinished",
+      ),
+    ).toEqual([
+      expect.objectContaining({
+        type: "tool.execution.started",
+        toolCallId: "native-tool-unfinished",
+      }),
+      expect.objectContaining({
+        type: "tool.execution.error",
+        toolCallId: "native-tool-unfinished",
+        errorCategory: "codex_native_tool_error",
+        terminalReason: "failed",
+      }),
+    ]);
+    expect(activeDiagnosticToolKeys(diagnosticEvents)).toEqual(new Set());
+  });
+
+  it("projects snapshot-only native side-thread tools exactly once", async () => {
+    const client = createFakeClient();
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribeDiagnostics = onInternalDiagnosticEvent((event) =>
+      diagnosticEvents.push(event),
+    );
+    client.request.mockImplementation(async (method: string) => {
+      if (method === "thread/fork") {
+        return threadResult("side-thread");
+      }
+      if (method === "thread/inject_items") {
+        return {};
+      }
+      if (method === "turn/start") {
+        setTimeout(() => {
+          const notification = turnCompleted("side-thread", "turn-1", "Snapshot answer.");
+          const turn = (notification.params as JsonObject).turn as JsonObject;
+          turn.items = [
+            nativeCommandItem("snapshot-tool-1", "completed", 19),
+            ...(turn.items as JsonValue[]),
+          ];
+          client.emit(notification);
+        }, 0);
+        return turnStartResult("turn-1");
+      }
+      if (method === "thread/unsubscribe" || method === "turn/interrupt") {
+        return {};
+      }
+      throw new Error(`unexpected request: ${method}`);
+    });
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+
+    try {
+      await runCodexAppServerSideQuestion(
+        sideParams({
+          agentId: "side-agent",
+          sessionKey: "agent:side-agent:main",
+          opts: { runId: "run-side-snapshot-tool" },
+        }),
+      );
+      await flushDiagnosticEvents();
+    } finally {
+      unsubscribeDiagnostics();
+    }
+
+    expect(
+      diagnosticEvents
+        .filter((event) => event.type.startsWith("tool.execution."))
+        .map((event) => ({
+          type: event.type,
+          toolCallId: "toolCallId" in event ? event.toolCallId : undefined,
+          durationMs: "durationMs" in event ? event.durationMs : undefined,
+        })),
+    ).toEqual([
+      {
+        type: "tool.execution.started",
+        toolCallId: "snapshot-tool-1",
+        durationMs: undefined,
+      },
+      {
+        type: "tool.execution.completed",
+        toolCallId: "snapshot-tool-1",
+        durationMs: 19,
+      },
+    ]);
+    expect(activeDiagnosticToolKeys(diagnosticEvents)).toEqual(new Set());
+  });
+
+  it("finalizes an active native side-thread tool when side completion times out", async () => {
+    vi.useFakeTimers();
+    const client = createFakeClient();
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribeDiagnostics = onInternalDiagnosticEvent((event) =>
+      diagnosticEvents.push(event),
+    );
+    client.request.mockImplementation(async (method: string) => {
+      if (method === "thread/fork") {
+        return threadResult("side-thread");
+      }
+      if (method === "thread/inject_items") {
+        return {};
+      }
+      if (method === "turn/start") {
+        setTimeout(() => {
+          client.emit({
+            method: "item/started",
+            params: {
+              ...codexTestTurnIds("side-thread"),
+              item: nativeCommandItem("native-tool-timeout", "inProgress", null),
+            },
+          });
+        }, 0);
+        return turnStartResult("turn-1");
+      }
+      if (method === "thread/unsubscribe" || method === "turn/interrupt") {
+        return {};
+      }
+      throw new Error(`unexpected request: ${method}`);
+    });
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+
+    try {
+      const runResult = runCodexAppServerSideQuestion(
+        sideParams({
+          agentId: "side-agent",
+          sessionKey: "agent:side-agent:main",
+          opts: { runId: "run-side-native-timeout" },
+        }),
+      ).catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(600_000);
+
+      await expect(runResult).resolves.toMatchObject({ name: "TimeoutError" });
+      await vi.runAllTimersAsync();
+      expect(diagnosticEvents).toContainEqual(
+        expect.objectContaining({
+          type: "tool.execution.error",
+          agentId: "side-agent",
+          toolCallId: "native-tool-timeout",
+          terminalReason: "timed_out",
+        }),
+      );
+      expect(activeDiagnosticToolKeys(diagnosticEvents)).toEqual(new Set());
+    } finally {
+      unsubscribeDiagnostics();
+    }
+  });
+
+  it("classifies an active side tool as timed out when side completion expires", async () => {
+    vi.useFakeTimers();
+    const client = createFakeClient();
+    const diagnosticEvents: DiagnosticEventPayload[] = [];
+    const unsubscribeDiagnostics = onInternalDiagnosticEvent((event) =>
+      diagnosticEvents.push(event),
+    );
+    toolExecuteMock.mockImplementation(
+      (_callId: string, _args: unknown, signal?: AbortSignal) =>
+        new Promise((_resolve, reject) => {
+          signal?.addEventListener(
+            "abort",
+            () => reject(signal.reason instanceof Error ? signal.reason : new Error("aborted")),
+            { once: true },
+          );
+        }),
+    );
+    client.request.mockImplementation(async (method: string) => {
+      if (method === "thread/fork") {
+        return threadResult("side-thread");
+      }
+      if (method === "thread/inject_items") {
+        return {};
+      }
+      if (method === "turn/start") {
+        setTimeout(() => {
+          void client.handleRequest({
+            id: 42,
+            method: "item/tool/call",
+            params: {
+              ...codexTestTurnIds("side-thread"),
+              callId: "tool-timeout",
+              tool: "wiki_status",
+              arguments: {},
+            },
+          });
+        }, 0);
+        return turnStartResult("turn-1");
+      }
+      if (method === "thread/unsubscribe" || method === "turn/interrupt") {
+        return {};
+      }
+      throw new Error(`unexpected request: ${method}`);
+    });
+    getSharedCodexAppServerClientMock.mockResolvedValue(client);
+
+    try {
+      const runPromise = runCodexAppServerSideQuestion(
+        sideParams({
+          agentId: "side-agent",
+          sessionKey: "global",
+          opts: { runId: "run-side-timeout" },
+        }),
+      );
+      const runResult = runPromise.catch((error: unknown) => error);
+      await vi.advanceTimersByTimeAsync(0);
+      await vi.advanceTimersByTimeAsync(600_000);
+
+      await expect(runResult).resolves.toMatchObject({ name: "TimeoutError" });
+      await vi.advanceTimersByTimeAsync(0);
+      expect(diagnosticEvents).toContainEqual(
+        expect.objectContaining({
+          type: "tool.execution.error",
+          agentId: "side-agent",
+          toolCallId: "tool-timeout",
+          terminalReason: "timed_out",
+        }),
+      );
+    } finally {
+      unsubscribeDiagnostics();
+    }
+  });
+
   it("normalizes hook channel ids for side-thread dynamic tool requests", async () => {
     const beforeToolCall = vi.fn((...args: unknown[]) => {
       const context = args[1] as { channelId?: string };
@@ -1634,8 +2855,7 @@ describe("runCodexAppServerSideQuestion", () => {
               id: 42,
               method: "item/tool/call",
               params: {
-                threadId: "side-thread",
-                turnId: "turn-1",
+                ...codexTestTurnIds("side-thread"),
                 callId: "tool-1",
                 tool: "wiki_status",
                 arguments: { topic: "AGENTS.md" },
@@ -1699,8 +2919,7 @@ describe("runCodexAppServerSideQuestion", () => {
               id: 43,
               method: "item/tool/requestUserInput",
               params: {
-                threadId: "side-thread",
-                turnId: "turn-1",
+                ...codexTestTurnIds("side-thread"),
                 itemId: "input-1",
                 questions: [
                   {
@@ -1729,57 +2948,6 @@ describe("runCodexAppServerSideQuestion", () => {
     expect(result).toEqual({ text: "No input needed." });
     expect(unrelatedUserInputResponse).toBeUndefined();
     expect(userInputResponse).toEqual({ answers: {} });
-  });
-
-  it("uses configured image generation timeout for side-thread image_generate calls", () => {
-    const timeoutMs = testing.resolveSideDynamicToolCallTimeoutMs({
-      call: {
-        threadId: "side-thread",
-        turnId: "turn-1",
-        callId: "tool-1",
-        tool: "image_generate",
-      },
-      config: {
-        agents: {
-          defaults: {
-            imageGenerationModel: {
-              timeoutMs: 123_456,
-            },
-          },
-        },
-      } as never,
-    });
-
-    expect(timeoutMs).toBe(123_456);
-  });
-
-  it("uses a 120 second default for side-thread image_generate calls", () => {
-    const timeoutMs = testing.resolveSideDynamicToolCallTimeoutMs({
-      call: {
-        threadId: "side-thread",
-        turnId: "turn-1",
-        callId: "tool-1",
-        tool: "image_generate",
-      },
-      config: {} as never,
-    });
-
-    expect(timeoutMs).toBe(120_000);
-  });
-
-  it("uses a 90 second default for generic side-thread dynamic tool calls", () => {
-    const timeoutMs = testing.resolveSideDynamicToolCallTimeoutMs({
-      call: {
-        threadId: "side-thread",
-        turnId: "turn-1",
-        callId: "tool-1",
-        tool: "session_status",
-        arguments: { sessionKey: "current" },
-      },
-      config: {} as never,
-    });
-
-    expect(timeoutMs).toBe(90_000);
   });
 
   it("cleans up notification handlers when side tool setup fails", async () => {
@@ -1818,11 +2986,14 @@ describe("runCodexAppServerSideQuestion", () => {
 
     await runCodexAppServerSideQuestion(sideParams());
 
-    expect(refreshCodexAppServerAuthTokensMock).toHaveBeenCalledWith({
-      agentDir: "/tmp/agent",
-      authProfileId: "openai:work",
-      config: {},
-    });
+    expect(refreshCodexAppServerAuthTokensMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        agentDir: "/tmp/agent",
+        authProfileId: "openai:work",
+        authProfileStore: expect.any(Object),
+        config: {},
+      }),
+    );
   });
 
   it("returns a clear setup error when there is no Codex parent thread", async () => {
@@ -1848,6 +3019,104 @@ describe("runCodexAppServerSideQuestion", () => {
       "Codex /btw needs an active Codex thread. Send a normal message first, then try /btw again.",
     );
   });
+
+  it.each([
+    { label: "after its request is written", written: true, interruptFails: false },
+    { label: "before its request is written", written: false, interruptFails: false },
+    {
+      label: "when Codex proves its native turn already ended",
+      written: true,
+      interruptFails: false,
+      alreadyTerminal: true,
+    },
+    {
+      label: "when its native thread cannot unsubscribe",
+      written: true,
+      interruptFails: false,
+      unsubscribeFails: true,
+    },
+    { label: "when its startup interrupt fails", written: true, interruptFails: true },
+    {
+      label: "when its startup interrupt and client retirement fail",
+      written: true,
+      interruptFails: true,
+      retirementFails: true,
+    },
+  ])(
+    "scopes side-turn abort cleanup $label",
+    async ({ written, interruptFails, retirementFails, alreadyTerminal, unsubscribeFails }) => {
+      const controller = new AbortController();
+      const harness = createClientHarness();
+      if (retirementFails) {
+        vi.spyOn(harness.client, "closeAndWait").mockRejectedValueOnce(
+          new Error("side client retirement failed"),
+        );
+      }
+      getSharedCodexAppServerClientMock.mockResolvedValue(harness.client);
+      const waitForRequest = async (method: string) =>
+        await vi.waitFor(
+          () => {
+            const request = harness.writes
+              .map((write) => JSON.parse(write) as { id: number; method: string; params: unknown })
+              .find((message) => message.method === method);
+            if (!request) {
+              throw new Error(`Codex side harness did not write ${method}`);
+            }
+            return request;
+          },
+          { interval: 1, timeout: 5_000 },
+        );
+      const run = runCodexAppServerSideQuestion(
+        sideParams({ opts: { abortSignal: controller.signal } }),
+      );
+      const failure = run.then(
+        () => undefined,
+        (error: unknown) => error,
+      );
+      const fork = await waitForRequest("thread/fork");
+      harness.send({ id: fork.id, result: threadResult("side-thread") });
+      const inject = await waitForRequest("thread/inject_items");
+      harness.send({ id: inject.id, result: {} });
+
+      if (written) {
+        const turnStart = await waitForRequest("turn/start");
+        controller.abort("side-start-cancelled");
+        const interrupt = await waitForRequest("turn/interrupt");
+        expect(interrupt.params).toEqual({ threadId: "side-thread", turnId: "" });
+        harness.send({ id: turnStart.id, result: turnStartResult("turn-1") });
+        harness.send(
+          alreadyTerminal
+            ? {
+                id: interrupt.id,
+                error: { code: -32_600, message: "no active turn to interrupt" },
+              }
+            : interruptFails
+              ? { id: interrupt.id, error: { code: -32_000, message: "side interrupt failed" } }
+              : { id: interrupt.id, result: {} },
+        );
+      } else {
+        controller.abort("side-start-cancelled");
+      }
+
+      if (!interruptFails) {
+        const unsubscribe = await waitForRequest("thread/unsubscribe");
+        harness.send(
+          unsubscribeFails
+            ? { id: unsubscribe.id, error: { code: -32_000, message: "side unsubscribe failed" } }
+            : { id: unsubscribe.id, result: {} },
+        );
+      }
+      await expect(failure).resolves.toMatchObject({ message: "turn/start aborted" });
+      expect(harness.writes.map((write) => JSON.parse(write).method)).toEqual([
+        "thread/fork",
+        "thread/inject_items",
+        ...(written ? ["turn/start", "turn/interrupt"] : []),
+        ...(!interruptFails ? ["thread/unsubscribe"] : []),
+      ]);
+      expect(harness.stdinDestroyed).toBe(interruptFails || unsubscribeFails === true);
+      harness.client.close();
+    },
+  );
 
   it("interrupts and unsubscribes the ephemeral thread on abort", async () => {
     const controller = new AbortController();
@@ -1885,3 +3154,4 @@ describe("runCodexAppServerSideQuestion", () => {
     );
   });
 });
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

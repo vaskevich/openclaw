@@ -21,7 +21,8 @@ import {
   updateGatewayReadyOutputState,
   waitForGatewayReady,
   writeConfig,
-} from "../../scripts/check-memory-fd-repro.mjs";
+} from "../../scripts/check-memory-fd-repro.mts";
+import { validateConfigObject } from "../../src/config/validation.js";
 import { withEnv } from "../../src/test-utils/env.js";
 
 async function listen(server: Server): Promise<number> {
@@ -175,7 +176,11 @@ describe("check-memory-fd-repro", () => {
         resultCount: 0,
       });
     } finally {
-      await new Promise<void>((resolve) => server.close(() => resolve()));
+      await new Promise<void>((resolve) => {
+        server.close(() => {
+          resolve();
+        });
+      });
     }
   });
 
@@ -196,21 +201,15 @@ describe("check-memory-fd-repro", () => {
         token: "test-token",
       });
       const config = JSON.parse(fs.readFileSync(configPath, "utf8"));
-      const memorySearch = config.agents.defaults.memorySearch;
+      const memorySearch = config.memory.search;
 
+      expect(validateConfigObject(config)).toMatchObject({ ok: true });
+      expect(memorySearch.store).toEqual({ vector: { enabled: false } });
       expect(memorySearch).toMatchObject({
         provider: "none",
         model: "",
-        store: {
-          path: path.join(homeDir, ".openclaw", "memory", "main.sqlite"),
-          vector: { enabled: false },
-        },
-        sync: {
-          onSearch: false,
-          onSessionStart: false,
-          watch: true,
-        },
       });
+      expect(memorySearch).not.toHaveProperty("sync");
     } finally {
       fs.rmSync(root, { recursive: true, force: true });
     }

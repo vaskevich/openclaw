@@ -110,9 +110,13 @@ function visitDiagnosticPayload(
     }
 
     if (shouldRedactImageData(record)) {
+      const imageData = record.data;
+      if (typeof imageData !== "string") {
+        return out;
+      }
       out.data = REDACTED_IMAGE_DATA;
-      out.bytes = estimateBase64DecodedBytes(record.data);
-      out.sha256 = digestBase64Payload(record.data);
+      out.bytes = estimateBase64DecodedBytes(imageData);
+      out.sha256 = digestBase64Payload(imageData);
     }
     return out;
   };
@@ -125,5 +129,7 @@ function visitDiagnosticPayload(
  * objects before persistence.
  */
 export function sanitizeDiagnosticPayload(value: unknown): unknown {
-  return visitDiagnosticPayload(value, { omitField: isCredentialFieldName });
+  return visitDiagnosticPayload(value, {
+    omitField: (key) => key === "providerReplay" || isCredentialFieldName(key),
+  });
 }

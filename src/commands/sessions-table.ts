@@ -4,8 +4,10 @@
  * Cleanup and listing commands use the same row shape and fixed-width cells so
  * terminal output stays aligned across commands.
  */
+import { sliceUtf16Safe, truncateUtf16Safe } from "@openclaw/normalization-core/utf16-slice";
 import { theme } from "../../packages/terminal-core/src/theme.js";
 import type { SessionEntry } from "../config/sessions.js";
+import { sessionEntryForkedFromParent } from "../config/sessions/session-entry-lineage.js";
 import { formatTimeAgo } from "../infra/format-time/format-relative.ts";
 
 /** Display row derived from a persisted session entry. */
@@ -14,6 +16,19 @@ export type SessionDisplayRow = {
   updatedAt: number | null;
   ageMs: number | null;
   sessionId?: string;
+  sessionFile?: string;
+  spawnedBy?: string;
+  spawnedWorkspaceDir?: string;
+  spawnedCwd?: string;
+  parentSessionKey?: string;
+  forkedFromParent?: boolean;
+  spawnDepth?: number;
+  subagentRole?: SessionEntry["subagentRole"];
+  subagentControlScope?: SessionEntry["subagentControlScope"];
+  sessionStartedAt?: number;
+  lastInteractionAt?: number;
+  label?: string;
+  status?: SessionEntry["status"];
   systemSent?: boolean;
   abortedLastRun?: boolean;
   thinkingLevel?: string;
@@ -27,6 +42,7 @@ export type SessionDisplayRow = {
   outputTokens?: number;
   totalTokens?: number;
   totalTokensFresh?: boolean;
+  totalTokensVersion?: 1;
   model?: string;
   modelProvider?: string;
   providerOverride?: string;
@@ -47,6 +63,18 @@ export function toSessionDisplayRow(key: string, entry: SessionEntry): SessionDi
     updatedAt,
     ageMs: updatedAt ? Date.now() - updatedAt : null,
     sessionId: entry?.sessionId,
+    spawnedBy: entry?.spawnedBy,
+    spawnedWorkspaceDir: entry?.spawnedWorkspaceDir,
+    spawnedCwd: entry?.spawnedCwd,
+    parentSessionKey: entry?.parentSessionKey,
+    forkedFromParent: sessionEntryForkedFromParent(entry) ? true : undefined,
+    spawnDepth: entry?.spawnDepth,
+    subagentRole: entry?.subagentRole,
+    subagentControlScope: entry?.subagentControlScope,
+    sessionStartedAt: entry?.sessionStartedAt,
+    lastInteractionAt: entry?.lastInteractionAt,
+    label: entry?.label,
+    status: entry?.status,
     systemSent: entry?.systemSent,
     abortedLastRun: entry?.abortedLastRun,
     thinkingLevel: entry?.thinkingLevel,
@@ -60,6 +88,7 @@ export function toSessionDisplayRow(key: string, entry: SessionEntry): SessionDi
     outputTokens: entry?.outputTokens,
     totalTokens: entry?.totalTokens,
     totalTokensFresh: entry?.totalTokensFresh,
+    totalTokensVersion: entry?.totalTokensVersion,
     model: entry?.model,
     modelProvider: entry?.modelProvider,
     providerOverride: entry?.providerOverride,
@@ -82,7 +111,7 @@ function truncateSessionKey(key: string): string {
   // Keep both the stable prefix and suffix; the tail often contains direct
   // recipient or runtime identifiers that distinguish otherwise similar keys.
   const head = Math.max(4, SESSION_KEY_PAD - 10);
-  return `${key.slice(0, head)}...${key.slice(-6)}`;
+  return `${truncateUtf16Safe(key, head)}...${sliceUtf16Safe(key, -6)}`;
 }
 
 /** Formats a session key cell for table output. */

@@ -183,6 +183,32 @@ describe("OpenAI-compatible image provider helper", () => {
     });
   });
 
+  it("checks config-backed auth under the credential owner, not its HTTP config alias", () => {
+    const provider = createProvider({ providerConfigKey: "different-http-provider" });
+    const cfg = {
+      models: {
+        providers: {
+          sample: {
+            apiKey: "sample-config-key",
+            baseUrl: "https://sample.example/v1/",
+            models: [],
+          },
+          "different-http-provider": {
+            apiKey: "wrong-owner-key",
+            baseUrl: "https://different-http-provider.example/v1/",
+            models: [],
+          },
+        },
+      },
+    };
+
+    expect(provider.isConfigured?.({ cfg })).toBe(true);
+    expect(isProviderApiKeyConfiguredMock).toHaveBeenCalledWith({
+      provider: "sample",
+      cfg,
+    });
+  });
+
   it("posts JSON generation requests and parses OpenAI-compatible image data", async () => {
     const release = mockGeneratedResponse();
     const provider = createProvider();
@@ -240,10 +266,10 @@ describe("OpenAI-compatible image provider helper", () => {
   });
 
   it("accepts valid multi-image JSON above the generic provider JSON cap", async () => {
-    const imageBytes = Buffer.alloc(6 * 1024 * 1024, 1);
+    const imageBytes = Buffer.alloc(3 * 1024 * 1024 + 64 * 1024, 1);
     postJsonRequestMock.mockResolvedValue({
       response: jsonResponse({
-        data: Array.from({ length: 3 }, () => ({
+        data: Array.from({ length: 4 }, () => ({
           b64_json: imageBytes.toString("base64"),
         })),
       }),
@@ -255,12 +281,13 @@ describe("OpenAI-compatible image provider helper", () => {
       provider: "sample",
       model: "sample-image",
       prompt: "large",
-      count: 3,
+      count: 4,
       cfg: {} as never,
     });
 
-    expect(result.images).toHaveLength(3);
+    expect(result.images).toHaveLength(4);
     expect(result.images.map((image) => image.buffer.byteLength)).toEqual([
+      imageBytes.byteLength,
       imageBytes.byteLength,
       imageBytes.byteLength,
       imageBytes.byteLength,

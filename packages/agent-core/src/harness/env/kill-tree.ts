@@ -1,11 +1,10 @@
 // Agent Core module implements kill tree behavior.
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { readFileSync } from "node:fs";
 
 const DEFAULT_GRACE_MS = 3000;
 const MAX_GRACE_MS = 60_000;
-const FORCE_KILL_SETTLE_MS = 1000;
-const PROCESS_EXIT_POLL_MS = 25;
-const TASKKILL_EXIT_TIMEOUT_MS = 5000;
+const TASKKILL_COMPLETION_TIMEOUT_MS = 3000;
 
 export type KillProcessTreeOptions = {
   graceMs?: number;
@@ -16,12 +15,18 @@ export type KillProcessTreeOptions = {
 /**
  * Best-effort process-tree termination with graceful shutdown.
  * - Windows: use taskkill /T to include descendants. Sends SIGTERM-equivalent
- *   first (without /F), then force-kills if process survives.
+ *   first (without /F), then force-kills if taskkill refuses or the process
+ *   survives the grace period.
  * - Unix: send SIGTERM to process group first, wait grace period, then SIGKILL.
  *
- * When the child was spawned with `detached: false`, pass `detached: false` to
- * skip the Unix `process.kill(-pid, ...)` group-kill. That avoids signaling the
- * gateway's own process group.
+ * Group kill (`process.kill(-pid, ...)`) is only used when the PID is verified
+ * as its own process group leader, unless `detached: true` is explicitly passed.
+ * This prevents accidentally signaling the gateway's process group when the
+ * child shares its parent's group.
+ *
+ * - `detached: false`: skip group kill unconditionally.
+ * - `detached: true`: use group kill unconditionally (trust caller).
+ * - `detached` omitted: use group kill only when PID is the group leader.
  */
 export function killProcessTree(pid: number, opts?: KillProcessTreeOptions): void {
   if (!Number.isFinite(pid) || pid <= 0) {
@@ -38,7 +43,8 @@ export function killProcessTree(pid: number, opts?: KillProcessTreeOptions): voi
     return;
   }
 
-  const useGroupKill = opts?.detached !== false;
+  const useGroupKill =
+    opts?.detached === true || (opts?.detached !== false && isProcessGroupLeader(pid));
   if (opts?.force === true) {
     signalProcessTreeUnix(pid, "SIGKILL", useGroupKill);
     return;
@@ -57,65 +63,25 @@ export function killProcessTree(pid: number, opts?: KillProcessTreeOptions): voi
   }, graceMs).unref();
 }
 
-/**
- * Process-tree termination for callers that must not report completion while
- * cleanup is still inside the grace window.
- */
-export async function killProcessTreeAndWait(
-  pid: number,
-  opts?: KillProcessTreeOptions,
-): Promise<void> {
-  if (!Number.isFinite(pid) || pid <= 0) {
-    return;
-  }
-
-  if (process.platform === "win32") {
-    if (opts?.force === true) {
-      await signalProcessTreeWindowsAndWait(pid, "SIGKILL");
-      await waitForProcessTreeExit(pid, false, FORCE_KILL_SETTLE_MS);
-      return;
-    }
-    const graceMs = normalizeGraceMs(opts?.graceMs);
-    const gracefulTaskkillSucceeded = await signalProcessTreeWindowsAndWait(pid, "SIGTERM");
-    if (gracefulTaskkillSucceeded && (await waitForProcessTreeExit(pid, false, graceMs))) {
-      return;
-    }
-    await signalProcessTreeWindowsAndWait(pid, "SIGKILL");
-    await waitForProcessTreeExit(pid, false, FORCE_KILL_SETTLE_MS);
-    return;
-  }
-
-  const useGroupKill = opts?.detached !== false;
-  if (opts?.force === true) {
-    signalProcessTreeUnix(pid, "SIGKILL", useGroupKill);
-    await waitForProcessTreeExit(pid, useGroupKill, FORCE_KILL_SETTLE_MS);
-    return;
-  }
-
-  const graceMs = normalizeGraceMs(opts?.graceMs);
-  signalProcessTreeUnix(pid, "SIGTERM", useGroupKill);
-  if (await waitForProcessTreeExit(pid, useGroupKill, graceMs)) {
-    return;
-  }
-  signalProcessTreeUnix(pid, "SIGKILL", useGroupKill);
-  await waitForProcessTreeExit(pid, useGroupKill, FORCE_KILL_SETTLE_MS);
-}
-
 export function signalProcessTree(
   pid: number,
   signal: "SIGTERM" | "SIGKILL",
-  opts?: { detached?: boolean },
+  opts?: { detached?: boolean; onComplete?: () => void },
 ): void {
   if (!Number.isFinite(pid) || pid <= 0) {
+    opts?.onComplete?.();
     return;
   }
 
   if (process.platform === "win32") {
-    signalProcessTreeWindows(pid, signal);
+    void signalProcessTreeWindowsAndWait(pid, signal).then(opts?.onComplete);
     return;
   }
 
-  signalProcessTreeUnix(pid, signal, opts?.detached !== false);
+  const useGroupKill =
+    opts?.detached === true || (opts?.detached !== false && isProcessGroupLeader(pid));
+  signalProcessTreeUnix(pid, signal, useGroupKill);
+  opts?.onComplete?.();
 }
 
 function normalizeGraceMs(value?: number): number {
@@ -134,35 +100,53 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-function isProcessTreeAlive(pid: number, useGroupKill: boolean): boolean {
-  if (!useGroupKill) {
-    return isProcessAlive(pid);
+function parseProcessGroupId(value: unknown): number | undefined {
+  if (typeof value !== "string" || !/^\d+$/.test(value.trim())) {
+    return undefined;
   }
-  return isProcessAlive(-pid) || isProcessAlive(pid);
+  const pgid = Number(value.trim());
+  return Number.isSafeInteger(pgid) && pgid > 0 ? pgid : undefined;
 }
 
-async function waitForProcessTreeExit(
-  pid: number,
-  useGroupKill: boolean,
-  timeoutMs: number,
-): Promise<boolean> {
-  if (!isProcessTreeAlive(pid, useGroupKill)) {
-    return true;
-  }
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    await delay(Math.min(PROCESS_EXIT_POLL_MS, deadline - Date.now()));
-    if (!isProcessTreeAlive(pid, useGroupKill)) {
-      return true;
+function readProcessGroupIdFromPs(pid: number): number | undefined {
+  try {
+    const res = spawnSync("ps", ["-p", String(pid), "-o", "pgid="], {
+      encoding: "utf8",
+      timeout: 500,
+    });
+    if (res.error || res.status !== 0) {
+      return undefined;
     }
+    return parseProcessGroupId(res.stdout);
+  } catch {
+    return undefined;
   }
-  return !isProcessTreeAlive(pid, useGroupKill);
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
+function readProcessGroupIdFromProc(pid: number): number | undefined {
+  try {
+    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+    const commEnd = stat.lastIndexOf(")");
+    if (commEnd < 0) {
+      return undefined;
+    }
+    // After comm: state, ppid, pgrp. The command name may contain spaces or ')'.
+    const fields = stat
+      .slice(commEnd + 1)
+      .trim()
+      .split(/\s+/);
+    return parseProcessGroupId(fields[2]);
+  } catch {
+    return undefined;
+  }
+}
+
+/** Fail closed to direct-PID signaling when group ownership cannot be proved. */
+function isProcessGroupLeader(pid: number): boolean {
+  // Linux exposes the fact in procfs; avoid a synchronous child process on the common path.
+  const procPgid = process.platform === "linux" ? readProcessGroupIdFromProc(pid) : undefined;
+  const pgid = procPgid ?? readProcessGroupIdFromPs(pid);
+  return pgid === pid;
 }
 
 function signalProcessTreeUnix(
@@ -186,76 +170,81 @@ function signalProcessTreeUnix(
   }
 }
 
-function runTaskkill(args: string[]): void {
-  try {
-    spawn("taskkill", args, {
-      stdio: "ignore",
-      detached: true,
-      windowsHide: true,
-    });
-  } catch {
-    // Ignore taskkill spawn failures.
-  }
-}
-
-function runTaskkillAndWait(args: string[]): Promise<boolean> {
+function runTaskkill(args: string[], onExit?: (code: number | null) => void): Promise<void> {
   return new Promise((resolve) => {
     let settled = false;
-    let timeoutId: NodeJS.Timeout | undefined;
-    let child: ReturnType<typeof spawn> | undefined;
-    const settle = (success: boolean) => {
+    const finish = (code: number | null) => {
       if (settled) {
         return;
       }
       settled = true;
-      if (timeoutId) {
-        clearTimeout(timeoutId);
-      }
-      resolve(success);
+      clearTimeout(completionTimer);
+      onExit?.(code);
+      resolve();
     };
+    const completionTimer = setTimeout(() => finish(null), TASKKILL_COMPLETION_TIMEOUT_MS);
+    completionTimer.unref?.();
     try {
-      child = spawn("taskkill", args, {
+      const child = spawn("taskkill", args, {
         stdio: "ignore",
+        detached: true,
         windowsHide: true,
       });
-      timeoutId = setTimeout(() => {
-        try {
-          child?.kill("SIGKILL");
-        } catch {
-          // Best effort: timeout already tells the caller to escalate.
-        }
-        settle(false);
-      }, TASKKILL_EXIT_TIMEOUT_MS);
-      child.once("error", () => settle(false));
-      child.once("close", (code) => settle(code === 0));
+      // A failed spawn emits error before a close with a negative errno. Only
+      // taskkill's first actual outcome may authorize immediate escalation.
+      child.once("error", () => finish(null));
+      child.once("close", (code) => finish(code));
     } catch {
-      settle(false);
+      // Ignore taskkill spawn failures.
+      finish(null);
     }
   });
 }
 
 function killProcessTreeWindows(pid: number, graceMs: number): void {
-  signalProcessTreeWindows(pid, "SIGTERM");
-
-  setTimeout(() => {
+  let forced = false;
+  let graceTimer: ReturnType<typeof setTimeout> | undefined;
+  const forceKill = () => {
+    if (forced) {
+      return;
+    }
+    // Latch before probing: a later live PID could belong to a reused,
+    // unrelated Windows process tree.
+    forced = true;
+    if (graceTimer !== undefined) {
+      clearTimeout(graceTimer);
+      graceTimer = undefined;
+    }
     if (!isProcessAlive(pid)) {
       return;
     }
     signalProcessTreeWindows(pid, "SIGKILL");
-  }, graceMs).unref();
+  };
+
+  signalProcessTreeWindows(pid, "SIGTERM", (code) => {
+    if (code !== null && code !== 0) {
+      forceKill();
+    }
+  });
+
+  graceTimer = setTimeout(forceKill, graceMs);
+  graceTimer.unref();
 }
 
-function signalProcessTreeWindows(pid: number, signal: "SIGTERM" | "SIGKILL"): void {
-  const args =
-    signal === "SIGKILL" ? ["/F", "/T", "/PID", String(pid)] : ["/T", "/PID", String(pid)];
-  runTaskkill(args);
-}
-
-async function signalProcessTreeWindowsAndWait(
+function signalProcessTreeWindows(
   pid: number,
   signal: "SIGTERM" | "SIGKILL",
-): Promise<boolean> {
+  onExit?: (code: number | null) => void,
+): void {
+  void signalProcessTreeWindowsAndWait(pid, signal, onExit);
+}
+
+function signalProcessTreeWindowsAndWait(
+  pid: number,
+  signal: "SIGTERM" | "SIGKILL",
+  onExit?: (code: number | null) => void,
+): Promise<void> {
   const args =
     signal === "SIGKILL" ? ["/F", "/T", "/PID", String(pid)] : ["/T", "/PID", String(pid)];
-  return runTaskkillAndWait(args);
+  return runTaskkill(args, onExit);
 }

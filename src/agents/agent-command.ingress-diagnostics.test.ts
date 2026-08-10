@@ -63,6 +63,63 @@ afterEach(() => {
   vi.clearAllMocks();
 });
 
+describe("resolveAgentRunLifecycleEndLogLevel", () => {
+  it("logs successful stop and tool-use metadata at info", () => {
+    expect(
+      testing.resolveAgentRunLifecycleEndLogLevel({
+        aborted: false,
+        stopReason: "stop",
+      }),
+    ).toBe("info");
+    expect(
+      testing.resolveAgentRunLifecycleEndLogLevel({
+        aborted: false,
+        stopReason: "toolUse",
+      }),
+    ).toBe("info");
+  });
+
+  it("does not log ordinary end-turn completions", () => {
+    expect(
+      testing.resolveAgentRunLifecycleEndLogLevel({
+        aborted: false,
+        stopReason: "end_turn",
+      }),
+    ).toBeUndefined();
+    expect(testing.resolveAgentRunLifecycleEndLogLevel({ aborted: false })).toBeUndefined();
+  });
+
+  it("keeps timeout metadata out of error severity", () => {
+    expect(
+      testing.resolveAgentRunLifecycleEndLogLevel({
+        aborted: true,
+        stopReason: "timeout",
+      }),
+    ).toBe("warn");
+    expect(
+      testing.resolveAgentRunLifecycleEndLogLevel({
+        stopReason: "stop",
+        timeoutPhase: "provider",
+        providerStarted: true,
+      }),
+    ).toBe("warn");
+  });
+
+  it("logs cancelled and failed endings at error", () => {
+    expect(
+      testing.resolveAgentRunLifecycleEndLogLevel({
+        aborted: true,
+        stopReason: "stop",
+      }),
+    ).toBe("error");
+    expect(
+      testing.resolveAgentRunLifecycleEndLogLevel({
+        stopReason: "error",
+      }),
+    ).toBe("error");
+  });
+});
+
 function makeResult(overrides?: Record<string, unknown>) {
   return {
     payloads: [{ text: "hello", mediaUrl: "" }],
@@ -176,6 +233,47 @@ describe("emitIngressModelUsageDiagnostic", () => {
       },
       durationMs: 1234,
     });
+  });
+
+  it("uses terminal cumulative usage only for the diagnostic event and cost", () => {
+    const result = makeResult({
+      agentMeta: {
+        diagnosticUsage: {
+          input: 900,
+          output: 300,
+          cacheRead: 70,
+          cacheWrite: 30,
+          total: 1300,
+        },
+      },
+    });
+
+    testing.emitIngressModelUsageDiagnostic(result, makeOpts());
+
+    expect(mocks.estimateUsageCost).toHaveBeenCalledWith({
+      usage: {
+        input: 900,
+        output: 300,
+        cacheRead: 70,
+        cacheWrite: 30,
+        total: 1300,
+      },
+      cost: {},
+    });
+    expect(mocks.emitTrustedDiagnosticEvent).toHaveBeenCalledWith(
+      expect.objectContaining({
+        usage: {
+          input: 900,
+          output: 300,
+          cacheRead: 70,
+          cacheWrite: 30,
+          promptTokens: 1000,
+          total: 1300,
+        },
+        lastCallUsage: { input: 500, output: 200 },
+        context: { limit: 128000, used: 1200 },
+      }),
+    );
   });
 
   it("does not emit when diagnostics are disabled", () => {

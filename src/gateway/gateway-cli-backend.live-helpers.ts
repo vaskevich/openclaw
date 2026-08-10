@@ -23,8 +23,10 @@ import {
 import { isTruthyEnvValue } from "../infra/env.js";
 import { getFreePortBlockWithPermissionFallback } from "../test-utils/ports.js";
 import { GATEWAY_CLIENT_MODES, GATEWAY_CLIENT_NAMES } from "../utils/message-channel.js";
+import { sleep } from "../utils/sleep.js";
 import { startGatewayClientWhenEventLoopReady } from "./client-start-readiness.js";
 import { GatewayClient, type GatewayClientOptions } from "./client.js";
+import { restoreLiveEnv, snapshotLiveEnv, type LiveEnvSnapshot } from "./live-env-test-helpers.js";
 
 // Aggregate docker live runs can contend on startup enough that the gateway
 // websocket handshake needs a wider budget than the single-provider reruns.
@@ -48,21 +50,7 @@ export type CliBackendLiveModelSelection = {
   agentRuntime: { id: string };
 };
 
-export type CliBackendLiveEnvSnapshot = {
-  configPath?: string;
-  stateDir?: string;
-  token?: string;
-  skipChannels?: string;
-  skipProviders?: string;
-  skipGmail?: string;
-  skipCron?: string;
-  skipCanvas?: string;
-  skipBrowserControl?: string;
-  bundledPluginsDir?: string;
-  minimalGateway?: string;
-  anthropicApiKey?: string;
-  anthropicApiKeyOld?: string;
-};
+export type CliBackendLiveEnvSnapshot = LiveEnvSnapshot;
 
 export const CLI_BACKEND_LIVE_PROVIDER_SKIP_ENV = "OPENCLAW_LIVE_CLI_BACKEND_ALLOW_PROVIDER_SKIP";
 export const CLI_BACKEND_LIVE_ADVISORY_ENV = "OPENCLAW_LIVE_CLI_BACKEND_ADVISORY";
@@ -70,6 +58,15 @@ export const CLI_BACKEND_LIVE_ADVISORY_ENV = "OPENCLAW_LIVE_CLI_BACKEND_ADVISORY
 export type CliBackendLiveProviderSkipDecision = {
   action: "fail" | "skip";
   message: string;
+};
+
+export type ClaudeCliResumeContinuityProbe = {
+  firstTurnMarker: string;
+  firstTurnPrompt: string;
+  injectedContext: string;
+  resumePrompt: string;
+  expectedFirstReply: string;
+  expectedResumeMarker: string;
 };
 
 function normalizeCliRuntimeModelTarget(raw: string | undefined): string | undefined {
@@ -271,6 +268,44 @@ export function matchesCliBackendReply(text: string, expected: string): boolean 
   );
 }
 
+export function buildClaudeCliResumeContinuityProbe(params: {
+  firstTurnNonce: string;
+  resumeNonce: string;
+  memoryToken: string;
+}): ClaudeCliResumeContinuityProbe {
+  const firstTurnMarker = `CLI-BACKEND-${params.firstTurnNonce}`;
+  return {
+    firstTurnMarker,
+    firstTurnPrompt: `Do not inspect files or run tools. Reply with exactly: ${firstTurnMarker}.`,
+    injectedContext:
+      `Remember this exact opaque session token for a later turn: ${params.memoryToken}. ` +
+      "Do not include the token in this turn's reply.",
+    resumePrompt:
+      "Do not inspect files or run tools. " +
+      `Return exactly two whitespace-separated tokens: CLI-RESUME-${params.resumeNonce} followed by ` +
+      "the exact opaque session token from the earlier turn. Do not add prose.",
+    expectedFirstReply: `${firstTurnMarker}.`,
+    expectedResumeMarker: `CLI-RESUME-${params.resumeNonce}`,
+  };
+}
+
+export function resolveImportedClaudeCliSessionId(messages: unknown[]): string | undefined {
+  for (const message of messages) {
+    const metadata =
+      typeof message === "object" && message !== null
+        ? (message as Record<string, unknown>)["__openclaw"]
+        : undefined;
+    if (typeof metadata !== "object" || metadata === null) {
+      continue;
+    }
+    const imported = metadata as { cliSessionId?: unknown; importedFrom?: unknown };
+    if (imported.importedFrom === "claude-cli" && typeof imported.cliSessionId === "string") {
+      return imported.cliSessionId;
+    }
+  }
+  return undefined;
+}
+
 export function withClaudeMcpConfigOverrides(args: string[], mcpConfigPath: string): string[] {
   const next = [...args];
   if (!next.includes("--strict-mcp-config")) {
@@ -309,12 +344,6 @@ export async function createBootstrapWorkspace(
   await fs.writeFile(path.join(workspaceDir, "IDENTITY.md"), `IDENTITY-${randomUUID()}\n`);
   await fs.writeFile(path.join(workspaceDir, "USER.md"), `USER-${randomUUID()}\n`);
   return { expectedInjectedFiles, workspaceDir, workspaceRootDir };
-}
-
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
 }
 
 export function shouldRetryCliCronMcpProbeReply(text: string): boolean {
@@ -373,6 +402,7 @@ export async function connectTestGatewayClient(params: {
   timeoutMs?: number;
   maxAttemptTimeoutMs?: number;
   clientDisplayName?: string | null;
+  caps?: string[];
   requestTimeoutMs?: number;
   tickWatchTimeoutMs?: number;
   waitForEventLoopReady?: boolean;
@@ -415,6 +445,7 @@ async function connectClientOnce(params: {
   timeoutMs: number;
   deviceIdentity?: DeviceIdentity;
   clientDisplayName?: string | null;
+  caps?: string[];
   requestTimeoutMs?: number;
   tickWatchTimeoutMs?: number;
   waitForEventLoopReady?: boolean;
@@ -449,6 +480,7 @@ async function connectClientOnce(params: {
       clientName: GATEWAY_CLIENT_NAMES.TEST,
       clientVersion: "dev",
       mode: GATEWAY_CLIENT_MODES.TEST,
+      ...(params.caps ? { caps: params.caps } : {}),
       connectChallengeTimeoutMs: params.timeoutMs,
       deviceIdentity: params.deviceIdentity,
       onHelloOk: () => finish({ client }),
@@ -508,21 +540,13 @@ function isRetryableGatewayConnectError(error: Error): boolean {
 }
 
 export function snapshotCliBackendLiveEnv(): CliBackendLiveEnvSnapshot {
-  return {
-    configPath: process.env.OPENCLAW_CONFIG_PATH,
-    stateDir: process.env.OPENCLAW_STATE_DIR,
-    token: process.env.OPENCLAW_GATEWAY_TOKEN,
-    skipChannels: process.env.OPENCLAW_SKIP_CHANNELS,
-    skipProviders: process.env.OPENCLAW_SKIP_PROVIDERS,
-    skipGmail: process.env.OPENCLAW_SKIP_GMAIL_WATCHER,
-    skipCron: process.env.OPENCLAW_SKIP_CRON,
-    skipCanvas: process.env.OPENCLAW_SKIP_CANVAS_HOST,
-    skipBrowserControl: process.env.OPENCLAW_SKIP_BROWSER_CONTROL_SERVER,
-    bundledPluginsDir: process.env.OPENCLAW_BUNDLED_PLUGINS_DIR,
-    minimalGateway: process.env.OPENCLAW_TEST_MINIMAL_GATEWAY,
-    anthropicApiKey: process.env.ANTHROPIC_API_KEY,
-    anthropicApiKeyOld: process.env.ANTHROPIC_API_KEY_OLD,
-  };
+  return snapshotLiveEnv([
+    "OPENCLAW_SKIP_PROVIDERS",
+    "OPENCLAW_BUNDLED_PLUGINS_DIR",
+    "OPENCLAW_TEST_MINIMAL_GATEWAY",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_API_KEY_OLD",
+  ]);
 }
 
 export function applyCliBackendLiveEnv(preservedEnv: ReadonlySet<string>): void {
@@ -542,27 +566,7 @@ export function applyCliBackendLiveEnv(preservedEnv: ReadonlySet<string>): void 
 }
 
 export function restoreCliBackendLiveEnv(snapshot: CliBackendLiveEnvSnapshot): void {
-  restoreEnvVar("OPENCLAW_CONFIG_PATH", snapshot.configPath);
-  restoreEnvVar("OPENCLAW_STATE_DIR", snapshot.stateDir);
-  restoreEnvVar("OPENCLAW_GATEWAY_TOKEN", snapshot.token);
-  restoreEnvVar("OPENCLAW_SKIP_CHANNELS", snapshot.skipChannels);
-  restoreEnvVar("OPENCLAW_SKIP_PROVIDERS", snapshot.skipProviders);
-  restoreEnvVar("OPENCLAW_SKIP_GMAIL_WATCHER", snapshot.skipGmail);
-  restoreEnvVar("OPENCLAW_SKIP_CRON", snapshot.skipCron);
-  restoreEnvVar("OPENCLAW_SKIP_CANVAS_HOST", snapshot.skipCanvas);
-  restoreEnvVar("OPENCLAW_SKIP_BROWSER_CONTROL_SERVER", snapshot.skipBrowserControl);
-  restoreEnvVar("OPENCLAW_BUNDLED_PLUGINS_DIR", snapshot.bundledPluginsDir);
-  restoreEnvVar("OPENCLAW_TEST_MINIMAL_GATEWAY", snapshot.minimalGateway);
-  restoreEnvVar("ANTHROPIC_API_KEY", snapshot.anthropicApiKey);
-  restoreEnvVar("ANTHROPIC_API_KEY_OLD", snapshot.anthropicApiKeyOld);
-}
-
-function restoreEnvVar(name: string, value: string | undefined): void {
-  if (value === undefined) {
-    delete process.env[name];
-    return;
-  }
-  process.env[name] = value;
+  restoreLiveEnv(snapshot);
 }
 
 export async function ensurePairedTestGatewayClientIdentity(params?: {

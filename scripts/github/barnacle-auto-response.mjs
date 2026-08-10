@@ -1,5 +1,6 @@
 // Barnacle owns deterministic GitHub triage and auto-response behavior.
 
+import { escapeRegExp } from "../lib/regexp.mjs";
 import {
   NEEDS_PR_CONTEXT_LABEL,
   PROOF_SUFFICIENT_LABEL,
@@ -76,6 +77,7 @@ const rules = [
   },
 ];
 
+/** @type {Record<string, { color: string; description: string }>} */
 export const managedLabelSpecs = {
   "r: skill": {
     color: "5319E7",
@@ -294,7 +296,7 @@ function extractIssueFormValue(body, field) {
   if (!body) {
     return "";
   }
-  const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escapedField = escapeRegExp(field);
   const regex = new RegExp(
     `(?:^|\\n)###\\s+${escapedField}\\s*\\n([\\s\\S]*?)(?=\\n###\\s+|$)`,
     "i",
@@ -317,7 +319,7 @@ function hasLinkedReference(text) {
 }
 
 function hasFilledTemplateLine(body, field) {
-  const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const escapedField = escapeRegExp(field);
   const regex = new RegExp(`^\\s*-\\s*${escapedField}:\\s*\\S`, "im");
   return regex.test(body);
 }
@@ -334,7 +336,7 @@ function hasMostlyBlankTemplate(body) {
     "Root cause",
     "Target test or file",
   ].filter((field) => {
-    const escapedField = field.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const escapedField = escapeRegExp(field);
     const regex = new RegExp(`^\\s*-\\s*${escapedField}(?: \\([^)]*\\))?:\\s*$`, "im");
     return regex.test(body);
   }).length;
@@ -897,6 +899,13 @@ async function removeLabels(github, context, issueNumber, labels, labelSet) {
   }
 }
 
+/**
+ * @param {{
+ *   github: Record<string, unknown>;
+ *   context: Record<string, unknown>;
+ *   core?: Pick<Console, "info">;
+ * }} params
+ */
 export async function runBarnacleAutoResponse({ github, context, core = console }) {
   const target = context.payload.issue ?? context.payload.pull_request;
   if (!target) {

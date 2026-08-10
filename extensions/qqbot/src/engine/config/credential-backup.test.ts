@@ -1,11 +1,15 @@
 // Qqbot tests cover credential backup plugin behavior.
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import {
   createPluginStateSyncKeyedStoreForTests,
   resetPluginStateStoreForTests,
 } from "openclaw/plugin-sdk/plugin-state-test-runtime";
+import {
+  resolvePreferredOpenClawTmpDir,
+  tempWorkspaceSync,
+  type TempWorkspaceSync,
+} from "openclaw/plugin-sdk/temp-path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   installQQBotRuntimeForStateTests,
@@ -19,13 +23,7 @@ type CredentialBackup = {
   savedAt: string;
 };
 
-const createdDirs: string[] = [];
-
-function createTempDir(prefix: string): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  createdDirs.push(dir);
-  return dir;
-}
+const tempWorkspaces: TempWorkspaceSync[] = [];
 
 async function useMockHome(homeDir: string): Promise<void> {
   vi.doMock("node:os", async (importOriginal) => {
@@ -43,13 +41,22 @@ function useStateDir(stateDir: string): void {
   installQQBotRuntimeForStateTests(stateDir);
 }
 
-function legacyOsHomeBackupPath(homeDir: string, accountId = "default"): string {
-  return path.join(homeDir, ".openclaw", "qqbot", "data", `credential-backup-${accountId}.json`);
-}
-
 function writeJson(filePath: string, value: unknown): void {
   fs.mkdirSync(path.dirname(filePath), { recursive: true });
   fs.writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`);
+}
+
+function legacyCredentialBackupFile(accountId: string): string {
+  return path.join(
+    process.env.OPENCLAW_STATE_DIR!,
+    "qqbot",
+    "data",
+    `credential-backup-${accountId}.json`,
+  );
+}
+
+function legacySingleCredentialBackupFile(): string {
+  return path.join(process.env.OPENCLAW_STATE_DIR!, "qqbot", "data", "credential-backup.json");
 }
 
 function readCredentialRows(stateDir: string): CredentialBackup[] {
@@ -64,8 +71,17 @@ function readCredentialRows(stateDir: string): CredentialBackup[] {
 describe("engine/config/credential-backup", () => {
   beforeEach(async () => {
     vi.resetModules();
-    const stateDir = createTempDir("qqbot-state-");
-    const homeDir = createTempDir("qqbot-home-");
+    const stateWorkspace = tempWorkspaceSync({
+      rootDir: resolvePreferredOpenClawTmpDir(),
+      prefix: "qqbot-state-",
+    });
+    const homeWorkspace = tempWorkspaceSync({
+      rootDir: resolvePreferredOpenClawTmpDir(),
+      prefix: "qqbot-home-",
+    });
+    tempWorkspaces.push(stateWorkspace, homeWorkspace);
+    const stateDir = stateWorkspace.dir;
+    const homeDir = homeWorkspace.dir;
     vi.stubEnv("HOME", homeDir);
     await useMockHome(homeDir);
     useStateDir(stateDir);
@@ -77,13 +93,12 @@ describe("engine/config/credential-backup", () => {
     vi.doUnmock("node:os");
     vi.resetModules();
     vi.unstubAllEnvs();
-    for (const dir of createdDirs.splice(0)) {
-      fs.rmSync(dir, { recursive: true, force: true });
+    for (const workspace of tempWorkspaces.splice(0)) {
+      workspace.cleanup();
     }
   });
 
   it("round-trips a credential snapshot through SQLite without writing JSON", async () => {
-    const { getCredentialBackupFile } = await import("../utils/data-paths.js");
     const { loadCredentialBackup, saveCredentialBackup } = await import("./credential-backup.js");
     const stateDir = process.env.OPENCLAW_STATE_DIR!;
 
@@ -95,7 +110,7 @@ describe("engine/config/credential-backup", () => {
       appId: "app-1",
       clientSecret: "secret-1",
     });
-    expect(fs.existsSync(getCredentialBackupFile("default"))).toBe(false);
+    expect(fs.existsSync(legacyCredentialBackupFile("default"))).toBe(false);
     expect(readCredentialRows(stateDir)).toHaveLength(1);
   });
 
@@ -104,7 +119,12 @@ describe("engine/config/credential-backup", () => {
     const stateDirA = process.env.OPENCLAW_STATE_DIR!;
     saveCredentialBackup("default", "app-a", "secret-a");
 
-    const stateDirB = createTempDir("qqbot-state-b-");
+    const stateWorkspaceB = tempWorkspaceSync({
+      rootDir: resolvePreferredOpenClawTmpDir(),
+      prefix: "qqbot-state-b-",
+    });
+    tempWorkspaces.push(stateWorkspaceB);
+    const stateDirB = stateWorkspaceB.dir;
     useStateDir(stateDirB);
     expect(loadCredentialBackup("default")).toBeNull();
     saveCredentialBackup("default", "app-b", "secret-b");
@@ -116,44 +136,24 @@ describe("engine/config/credential-backup", () => {
     expect(loadCredentialBackup("default")?.appId).toBe("app-b");
   });
 
-  it("imports the state-dir legacy per-account JSON backup once", async () => {
-    const { getCredentialBackupFile } = await import("../utils/data-paths.js");
+  it("does not import state-dir legacy JSON backups during runtime reads", async () => {
     const { loadCredentialBackup } = await import("./credential-backup.js");
-    writeJson(getCredentialBackupFile("default"), {
+    const legacyFile = legacyCredentialBackupFile("default");
+    writeJson(legacyFile, {
       accountId: "default",
       appId: "app-old",
       clientSecret: "secret-old",
       savedAt: new Date().toISOString(),
     });
 
-    const loaded = loadCredentialBackup("default");
-
-    expect(loaded?.appId).toBe("app-old");
-    expect(fs.existsSync(getCredentialBackupFile("default"))).toBe(false);
-    expect(loadCredentialBackup("default")?.clientSecret).toBe("secret-old");
+    expect(loadCredentialBackup("default")).toBeNull();
+    expect(fs.existsSync(legacyFile)).toBe(true);
   });
 
-  it("imports the old OS-home JSON backup once", async () => {
+  it("does not import legacy single-file backups during runtime reads", async () => {
     const { loadCredentialBackup } = await import("./credential-backup.js");
-    const legacyPath = legacyOsHomeBackupPath(process.env.HOME!);
-    writeJson(legacyPath, {
-      accountId: "default",
-      appId: "app-home",
-      clientSecret: "secret-home",
-      savedAt: new Date().toISOString(),
-    });
-
-    const loaded = loadCredentialBackup("default");
-
-    expect(loaded?.appId).toBe("app-home");
-    expect(fs.existsSync(legacyPath)).toBe(false);
-    expect(loadCredentialBackup("default")?.clientSecret).toBe("secret-home");
-  });
-
-  it("returns null when the legacy single-file backup belongs to a different accountId", async () => {
-    const { getLegacyCredentialBackupFile } = await import("../utils/data-paths.js");
-    const { loadCredentialBackup } = await import("./credential-backup.js");
-    writeJson(getLegacyCredentialBackupFile(), {
+    const legacyFile = legacySingleCredentialBackupFile();
+    writeJson(legacyFile, {
       accountId: "other-acct",
       appId: "app-old",
       clientSecret: "secret-old",
@@ -161,7 +161,7 @@ describe("engine/config/credential-backup", () => {
     });
 
     expect(loadCredentialBackup("default")).toBeNull();
-    expect(fs.existsSync(getLegacyCredentialBackupFile())).toBe(true);
+    expect(fs.existsSync(legacyFile)).toBe(true);
   });
 
   it("ignores empty appId/clientSecret on save", async () => {

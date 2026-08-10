@@ -1,7 +1,7 @@
 // Discord tests cover send.components plugin behavior.
 import { ChannelType, MessageFlags } from "discord-api-types/v10";
 import { beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
-import { makeDiscordRest } from "./send.test-harness.js";
+import { createDiscordLoopbackRest, makeDiscordRest } from "./send.test-harness.js";
 
 const loadConfigMock = vi.hoisted(() => vi.fn(() => ({ session: { dmScope: "main" } })));
 
@@ -52,6 +52,7 @@ function resetClassicMocks(): void {
   loadOutboundMediaFromUrlMock.mockResolvedValue({
     buffer: Buffer.from("media"),
     fileName: "report.pdf",
+    contentType: "application/pdf",
   });
   vi.clearAllMocks();
 }
@@ -101,6 +102,25 @@ describe("sendDiscordComponentMessage", () => {
     resetClassicMocks();
   });
 
+  it("passes allowed mentions through component sends", async () => {
+    const { rest, postMock, getMock } = makeDiscordRest();
+    getMock.mockResolvedValueOnce({ type: ChannelType.GuildText, id: "chan-1" });
+    postMock.mockResolvedValueOnce({ id: "msg1", channel_id: "chan-1" });
+
+    await sendDiscordComponentMessage(
+      "channel:chan-1",
+      { blocks: [{ type: "actions", buttons: [{ label: "Open" }] }] },
+      {
+        cfg: DISCORD_TEST_CFG,
+        rest,
+        token: "t",
+        allowedMentions: { parse: [] },
+      },
+    );
+
+    expect(readRecordArg(postMock, 0, 1).body).toMatchObject({ allowed_mentions: { parse: [] } });
+  });
+
   it("keeps direct-channel DM session keys on component entries", async () => {
     const { rest, postMock, getMock } = makeDiscordRest();
     getMock.mockResolvedValueOnce({
@@ -130,6 +150,27 @@ describe("sendDiscordComponentMessage", () => {
     );
   });
 
+  it("reports the platform send before component registry bookkeeping", async () => {
+    const { rest, postMock, getMock } = makeDiscordRest();
+    getMock.mockResolvedValueOnce({ type: ChannelType.GuildText, id: "chan-1" });
+    postMock.mockResolvedValueOnce({ id: "msg-progress", channel_id: "chan-1" });
+    registerMock.mockImplementationOnce(() => {
+      throw new Error("registry write failed");
+    });
+    const onDeliveryResult = vi.fn();
+
+    await expect(
+      sendDiscordComponentMessage(
+        "channel:chan-1",
+        { blocks: [{ type: "actions", buttons: [{ label: "Tap" }] }] },
+        { cfg: DISCORD_TEST_CFG, rest, token: "t", onDeliveryResult },
+      ),
+    ).rejects.toThrow("registry write failed");
+
+    expect(onDeliveryResult).toHaveBeenCalledOnce();
+    expect(onDeliveryResult.mock.calls[0]?.[0]?.messageId).toBe("msg-progress");
+  });
+
   it("edits component messages and refreshes component registry entries", async () => {
     const { rest, patchMock, getMock } = makeDiscordRest();
     getMock.mockResolvedValueOnce({
@@ -157,12 +198,21 @@ describe("sendDiscordComponentMessage", () => {
     expect(patchMock).toHaveBeenCalledTimes(1);
     const [patchUrl, patchRequest] = readMockCall(patchMock, 0) as [
       string,
-      { body?: { flags?: unknown; components?: unknown[] } },
+      {
+        body?: {
+          flags?: unknown;
+          components?: unknown[];
+          nonce?: unknown;
+          enforce_nonce?: unknown;
+        };
+      },
     ];
     expect(patchUrl).toContain("/channels/chan-1/messages/msg1");
     expect(patchRequest?.body?.flags).toBe(MessageFlags.IsComponentsV2);
     expect(Array.isArray(patchRequest?.body?.components)).toBe(true);
     expect(patchRequest?.body?.components).toHaveLength(1);
+    expect(patchRequest?.body).not.toHaveProperty("nonce");
+    expect(patchRequest?.body).not.toHaveProperty("enforce_nonce");
     expect(registerMock).toHaveBeenCalledTimes(1);
     const args = readRecordArg(registerMock, 0, 0);
     expect(args.messageId).toBe("msg1");
@@ -263,6 +313,7 @@ describe("sendDiscordComponentMessage classic message downgrade", () => {
   it("forwards mediaReadFile and mediaAccess to sendMessageDiscord", async () => {
     const readFileMock = vi.fn().mockResolvedValue(Buffer.from("pdf"));
     const mediaAccess = { localRoots: ["/tmp"], readFile: readFileMock };
+    const onDeliveryResult = vi.fn();
 
     await sendDiscordComponentMessage(
       "channel:chan-1",
@@ -273,6 +324,7 @@ describe("sendDiscordComponentMessage classic message downgrade", () => {
         mediaUrl: "https://example.com/report.pdf",
         mediaReadFile: readFileMock,
         mediaAccess,
+        onDeliveryResult,
       },
     );
 
@@ -290,14 +342,34 @@ describe("sendDiscordComponentMessage classic message downgrade", () => {
         mediaLocalRoots: undefined,
         mediaReadFile: readFileMock,
         mediaAccess,
-        replyTo: undefined,
+        reply: undefined,
         silent: undefined,
         textLimit: undefined,
         maxLinesPerMessage: undefined,
         tableMode: undefined,
         chunkMode: undefined,
+        onDeliveryResult,
       },
     ]);
+  });
+
+  it("forwards first-chunk reply fanout through classic media downgrades", async () => {
+    await sendDiscordComponentMessage(
+      "channel:chan-1",
+      { blocks: [{ type: "text", text: "report" }] },
+      {
+        cfg: DISCORD_TEST_CFG,
+        token: "t",
+        mediaUrl: "https://example.com/report.pdf",
+        reply: { messageId: "source-1", scope: "first" },
+      },
+    );
+
+    expect(sendMessageDiscordMock).toHaveBeenCalledTimes(1);
+    const options = readMockCall(sendMessageDiscordMock, 0)[2] as {
+      reply?: { messageId: string; scope: "all" | "first" };
+    };
+    expect(options.reply).toEqual({ messageId: "source-1", scope: "first" });
   });
 
   it("keeps modal component messages on the component path", async () => {
@@ -339,6 +411,36 @@ describe("sendDiscordComponentMessage classic message downgrade", () => {
     expect(modals[0]?.title).toBe("Feedback");
     expect(modals[0]?.fields).toHaveLength(1);
     expect(modals[0]?.fields?.[0]?.label).toBe("Notes");
+  });
+
+  it("sends the detected PDF media type across a real component multipart request", async () => {
+    const loopback = await createDiscordLoopbackRest();
+    try {
+      await sendDiscordComponentMessage(
+        "channel:789",
+        {
+          text: "report",
+          modal: {
+            title: "Feedback",
+            fields: [{ type: "text", label: "Notes" }],
+          },
+        },
+        {
+          cfg: DISCORD_TEST_CFG,
+          rest: loopback.rest,
+          token: "test-token",
+          mediaUrl: "https://example.com/report.pdf",
+        },
+      );
+
+      const upload = loopback.requests.find((request) => request.method === "POST");
+      expect(upload?.path).toContain("/channels/789/messages");
+      expect(upload?.contentType).toMatch(/^multipart\/form-data; boundary=/);
+      expect(upload?.body).toContain('name="files[0]"; filename="report.pdf"');
+      expect(upload?.body).toContain("Content-Type: application/pdf");
+    } finally {
+      await loopback.close();
+    }
   });
 
   it("treats bare numeric component send targets as channels", async () => {

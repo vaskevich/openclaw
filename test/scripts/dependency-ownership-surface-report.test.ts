@@ -9,7 +9,7 @@ import {
   packageNameFromLockKey,
   parseArgs,
   renderDependencyOwnershipSurfaceMarkdownReport,
-} from "../../scripts/dependency-ownership-surface-report.mjs";
+} from "../../scripts/dependency-ownership-surface-report.mts";
 
 const tempDirs: string[] = [];
 
@@ -62,9 +62,9 @@ describe("parseArgs", () => {
     expect(() => parseArgs(["--json", "first.json", "--json", "second.json"])).toThrow(
       "--json was provided more than once.",
     );
-    expect(() =>
-      parseArgs(["--markdown", "first.md", "--markdown", "second.md"]),
-    ).toThrow("--markdown was provided more than once.");
+    expect(() => parseArgs(["--markdown", "first.md", "--markdown", "second.md"])).toThrow(
+      "--markdown was provided more than once.",
+    );
   });
 });
 

@@ -8,22 +8,20 @@ import {
 import {
   listAgentEntries,
   listAgentIds,
-  resolveDefaultAgentDir,
+  resolveAgentDir,
   resolveAgentWorkspaceDir,
   resolveDefaultAgentId,
 } from "../agents/agent-scope.js";
 import { createOpenClawCodingTools } from "../agents/agent-tools.js";
 import { resolveEffectiveToolPolicy } from "../agents/agent-tools.policy.js";
+import { resolveConversationCapabilityProfile } from "../agents/conversation-capability-profile.js";
 import { DEFAULT_MODEL, DEFAULT_PROVIDER } from "../agents/defaults.js";
 import { applyFinalEffectiveToolPolicy } from "../agents/embedded-agent-runner/effective-tool-policy.js";
 import { shouldCreateBundleMcpRuntimeForAttempt } from "../agents/embedded-agent-runner/run/attempt-tool-construction-plan.js";
-import {
-  findModelInCatalog,
-  loadModelCatalog,
-  type ModelCatalogEntry,
-} from "../agents/model-catalog.js";
+import { findModelInCatalog, type ModelCatalogEntry } from "../agents/model-catalog.js";
 import { resolveDefaultModelForAgent } from "../agents/model-selection.js";
 import { supportsModelTools } from "../agents/model-tool-support.js";
+import { loadPreparedModelCatalog } from "../agents/prepared-model-catalog.js";
 import { normalizeAgentRuntimeTools } from "../agents/runtime-plan/tools.js";
 import { collectExplicitAllowlist, normalizeToolName } from "../agents/tool-policy.js";
 import {
@@ -33,7 +31,11 @@ import {
 import type { AnyAgentTool } from "../agents/tools/common.js";
 import { probeGatewayStatus } from "../cli/daemon-cli/probe.js";
 import { collectUnavailableAgentSkills } from "../commands/doctor-skills-core.js";
-import { gatewayProbeResultSawGateway } from "../commands/gateway-health-auth-diagnostic.js";
+import {
+  GATEWAY_HEALTH_RATE_LIMITED_MESSAGE,
+  gatewayProbeResultSawGateway,
+  gatewayProbeResultWasRateLimited,
+} from "../commands/gateway-health-auth-diagnostic.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   getSystemdCgroupHygieneSummary,
@@ -42,6 +44,11 @@ import {
 import { resolveGatewayService, readGatewayServiceState } from "../daemon/service.js";
 import { buildGatewayProbeConnectionDetails } from "../gateway/call.js";
 import { formatErrorMessage } from "../infra/errors.js";
+import {
+  formatLocalAudioSelection,
+  inspectLocalAudioSelection,
+} from "../media-understanding/local-audio.js";
+import type { PluginMetadataSnapshotScopeRunner } from "../plugins/current-plugin-metadata-snapshot.js";
 import type { ProviderRuntimeModel } from "../plugins/provider-runtime-model.types.js";
 import { getPluginToolMeta, setPluginToolMeta } from "../plugins/tools.js";
 import type { ProviderCatalogOrder, ProviderPlugin } from "../plugins/types.js";
@@ -65,6 +72,38 @@ export function detectUnavailableSkills(cfg: OpenClawConfig): SkillStatusEntry[]
     agentId,
   });
   return collectUnavailableAgentSkills(report);
+}
+
+export async function collectLocalAudioAccelerationFindings(): Promise<readonly HealthFinding[]> {
+  const selection = await inspectLocalAudioSelection();
+  const available = selection.candidates.filter((candidate) => candidate.available);
+  if (available.length === 0) {
+    return [];
+  }
+  const summary = formatLocalAudioSelection(selection);
+  if (summary) {
+    return [
+      {
+        checkId: "core/doctor/local-audio-acceleration",
+        severity: "info",
+        message: `Local STT auto-selection: ${summary}.`,
+        path: "tools.media.models",
+      },
+    ];
+  }
+  const blockers = available
+    .map((candidate) => `${candidate.command}: ${candidate.reason}`)
+    .join("; ");
+  return [
+    {
+      checkId: "core/doctor/local-audio-acceleration",
+      severity: "info",
+      message: `Local STT commands were found but none are ready for auto-selection: ${blockers}.`,
+      path: "tools.media.models",
+      fixHint:
+        "Install the matching local model/runtime, or configure an audio-capable tools.media.models CLI entry.",
+    },
+  ];
 }
 
 export async function collectGatewayHealthFindings(
@@ -97,10 +136,22 @@ export async function collectGatewayHealthFindings(
     config: ctx.cfg,
     json: true,
   });
+  const mode = ctx.cfg.gateway?.mode === "remote" ? "remote" : "local";
+  if (gatewayProbeResultWasRateLimited(probe)) {
+    return [
+      {
+        checkId: "core/doctor/gateway-health",
+        severity: "warning",
+        message: GATEWAY_HEALTH_RATE_LIMITED_MESSAGE,
+        path: mode === "remote" ? "gateway.remote.url" : "gateway.mode",
+        target: formatGatewayHealthTarget(probeDetails.url),
+        fixHint: "Wait for the temporary authentication lockout to expire, then rerun doctor.",
+      },
+    ];
+  }
   if (gatewayProbeResultSawGateway(probe)) {
     return [];
   }
-  const mode = ctx.cfg.gateway?.mode === "remote" ? "remote" : "local";
   return [
     {
       checkId: "core/doctor/gateway-health",
@@ -571,7 +622,6 @@ export async function collectProviderCatalogProjectionFindings(
   const { runProviderStaticCatalog } = await import("../plugins/provider-discovery.js");
   const { resolvePluginProviders } = await import("../plugins/providers.runtime.js");
   const env = process.env;
-  const agentDir = resolveDefaultAgentDir(cfg);
   const workspaceDir = resolveAgentWorkspaceDir(cfg, resolveDefaultAgentId(cfg));
   let providers: Awaited<ReturnType<typeof resolvePluginProviders>>;
   try {
@@ -630,13 +680,7 @@ export async function collectProviderCatalogProjectionFindings(
       }
       let result: Awaited<ReturnType<typeof runProviderStaticCatalog>>;
       try {
-        result = await runProviderStaticCatalog({
-          provider,
-          config: cfg,
-          agentDir,
-          workspaceDir,
-          env,
-        });
+        result = await runProviderStaticCatalog({ provider });
       } catch (error) {
         findings.push(
           providerCatalogProjectionFinding({
@@ -792,9 +836,12 @@ function collectBundleMcpRuntimeToolSchemaFindings(params: {
   const activeBundleTools = applyFinalEffectiveToolPolicy({
     bundledTools: params.bundleRuntime.tools,
     config: params.cfg,
-    agentId: params.agentId,
-    modelProvider: params.modelRef.provider,
-    modelId: params.modelRef.model,
+    conversationCapabilityProfile: resolveConversationCapabilityProfile({
+      config: params.cfg,
+      agentId: params.agentId,
+      modelProvider: params.modelRef.provider,
+      modelId: params.modelRef.model,
+    }),
     warn: () => {},
     toolPolicyAuditLogLevel: "debug",
   });
@@ -1002,9 +1049,12 @@ function shouldReportBundleMcpRuntimeDiagnostic(params: {
     applyFinalEffectiveToolPolicy({
       bundledTools: collectBundleMcpDiagnosticSentinels(params),
       config: params.cfg,
-      agentId: params.agentId,
-      modelProvider: params.modelRef.provider,
-      modelId: params.modelRef.model,
+      conversationCapabilityProfile: resolveConversationCapabilityProfile({
+        config: params.cfg,
+        agentId: params.agentId,
+        modelProvider: params.modelRef.provider,
+        modelId: params.modelRef.model,
+      }),
       warn: () => {},
       toolPolicyAuditLogLevel: "debug",
     }).length > 0
@@ -1036,8 +1086,8 @@ function isAcpRuntimeAgent(cfg: OpenClawConfig, agentId: string): boolean {
 
 export async function collectRuntimeToolSchemaFindings(
   cfg: OpenClawConfig,
+  options?: { runWithPluginMetadataSnapshot?: PluginMetadataSnapshotScopeRunner },
 ): Promise<readonly HealthFinding[]> {
-  const catalog = await loadModelCatalog({ config: cfg });
   const findings: HealthFinding[] = [];
   const bundleRuntimeByWorkspace = new Map<string, BundleMcpToolRuntime>();
   const bundleRuntimeLoadErrorsByWorkspace = new Map<string, HealthFinding>();
@@ -1048,72 +1098,27 @@ export async function collectRuntimeToolSchemaFindings(
         continue;
       }
       const workspaceDir = resolveAgentWorkspaceDir(cfg, agentId);
-      const modelRef = resolveDefaultModelForAgent({
-        cfg,
-        agentId,
-        allowPluginNormalization: true,
-      });
-      const model = buildDoctorRuntimeModel({
-        entry: findModelInCatalog(catalog, modelRef.provider, modelRef.model),
-        provider: modelRef.provider,
-        modelId: modelRef.model,
-      });
-      if (!supportsModelTools(model)) {
-        continue;
-      }
-      findings.push(
-        ...collectAgentRuntimeToolSchemaFindings({
+      const collectForAgent = async () => {
+        const catalog = await loadPreparedModelCatalog({
+          config: cfg,
+          agentId,
+          agentDir: resolveAgentDir(cfg, agentId),
+        });
+        const modelRef = resolveDefaultModelForAgent({
           cfg,
           agentId,
-          workspaceDir,
-          modelRef,
-          model,
-        }),
-      );
-      if (!shouldCreateBundleMcpRuntimeForAttempt({ toolsEnabled: true })) {
-        continue;
-      }
-      if (
-        !bundleRuntimeByWorkspace.has(workspaceDir) &&
-        !bundleRuntimeLoadErrorsByWorkspace.has(workspaceDir)
-      ) {
-        try {
-          bundleRuntimeByWorkspace.set(
-            workspaceDir,
-            await createBundleMcpToolRuntime({
-              workspaceDir,
-              cfg,
-            }),
-          );
-        } catch (error) {
-          bundleRuntimeLoadErrorsByWorkspace.set(
-            workspaceDir,
-            bundleMcpRuntimeLoadFailureFinding(error),
-          );
-        }
-      }
-      const bundleRuntimeLoadError = bundleRuntimeLoadErrorsByWorkspace.get(workspaceDir);
-      if (bundleRuntimeLoadError) {
-        if (!reportedBundleRuntimeLoadErrors.has(workspaceDir)) {
-          findings.push(bundleRuntimeLoadError);
-          reportedBundleRuntimeLoadErrors.add(workspaceDir);
-        }
-        continue;
-      }
-      const bundleRuntime = bundleRuntimeByWorkspace.get(workspaceDir);
-      if (bundleRuntime) {
-        if (bundleRuntime.diagnostics && bundleRuntime.diagnostics.length > 0) {
-          const policyActiveDiagnostics = filterPolicyActiveBundleMcpDiagnostics({
-            diagnostics: bundleRuntime.diagnostics,
-            cfg,
-            agentId,
-            modelRef,
-          });
-          findings.push(...policyActiveDiagnostics.map(bundleMcpRuntimeDiagnosticFinding));
+          allowPluginNormalization: true,
+        });
+        const model = buildDoctorRuntimeModel({
+          entry: findModelInCatalog(catalog, modelRef.provider, modelRef.model),
+          provider: modelRef.provider,
+          modelId: modelRef.model,
+        });
+        if (!supportsModelTools(model)) {
+          return;
         }
         findings.push(
-          ...collectBundleMcpRuntimeToolSchemaFindings({
-            bundleRuntime,
+          ...collectAgentRuntimeToolSchemaFindings({
             cfg,
             agentId,
             workspaceDir,
@@ -1121,6 +1126,63 @@ export async function collectRuntimeToolSchemaFindings(
             model,
           }),
         );
+        if (!shouldCreateBundleMcpRuntimeForAttempt({ toolsEnabled: true })) {
+          return;
+        }
+        if (
+          !bundleRuntimeByWorkspace.has(workspaceDir) &&
+          !bundleRuntimeLoadErrorsByWorkspace.has(workspaceDir)
+        ) {
+          try {
+            bundleRuntimeByWorkspace.set(
+              workspaceDir,
+              await createBundleMcpToolRuntime({
+                workspaceDir,
+                cfg,
+              }),
+            );
+          } catch (error) {
+            bundleRuntimeLoadErrorsByWorkspace.set(
+              workspaceDir,
+              bundleMcpRuntimeLoadFailureFinding(error),
+            );
+          }
+        }
+        const bundleRuntimeLoadError = bundleRuntimeLoadErrorsByWorkspace.get(workspaceDir);
+        if (bundleRuntimeLoadError) {
+          if (!reportedBundleRuntimeLoadErrors.has(workspaceDir)) {
+            findings.push(bundleRuntimeLoadError);
+            reportedBundleRuntimeLoadErrors.add(workspaceDir);
+          }
+          return;
+        }
+        const bundleRuntime = bundleRuntimeByWorkspace.get(workspaceDir);
+        if (bundleRuntime) {
+          if (bundleRuntime.diagnostics && bundleRuntime.diagnostics.length > 0) {
+            const policyActiveDiagnostics = filterPolicyActiveBundleMcpDiagnostics({
+              diagnostics: bundleRuntime.diagnostics,
+              cfg,
+              agentId,
+              modelRef,
+            });
+            findings.push(...policyActiveDiagnostics.map(bundleMcpRuntimeDiagnosticFinding));
+          }
+          findings.push(
+            ...collectBundleMcpRuntimeToolSchemaFindings({
+              bundleRuntime,
+              cfg,
+              agentId,
+              workspaceDir,
+              modelRef,
+              model,
+            }),
+          );
+        }
+      };
+      if (options?.runWithPluginMetadataSnapshot) {
+        await options.runWithPluginMetadataSnapshot({ config: cfg, workspaceDir }, collectForAgent);
+      } else {
+        await collectForAgent();
       }
     }
   } finally {
@@ -1128,3 +1190,4 @@ export async function collectRuntimeToolSchemaFindings(
   }
   return findings;
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

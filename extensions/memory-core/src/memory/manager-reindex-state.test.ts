@@ -1,12 +1,15 @@
 // Memory Core tests cover manager reindex state plugin behavior.
-import type { MemorySource } from "openclaw/plugin-sdk/memory-core-host-engine-storage";
+import {
+  MEMORY_CHUNKING_VERSION,
+  type MemorySource,
+} from "openclaw/plugin-sdk/memory-core-host-engine-storage";
 import { describe, expect, it } from "vitest";
 import {
+  MEMORY_INDEX_PROVENANCE_VERSION,
   resolveConfiguredScopeHash,
   resolveConfiguredSourcesForMeta,
   resolveMemoryIndexProviderIdentities,
   resolveMemoryIndexIdentityState,
-  isMemoryIndexIdentityDirty,
   type MemoryIndexMeta,
 } from "./manager-reindex-state.js";
 
@@ -19,7 +22,9 @@ function createMeta(overrides: Partial<MemoryIndexMeta> = {}): MemoryIndexMeta {
     scopeHash: "scope-v1",
     chunkTokens: 4000,
     chunkOverlap: 0,
+    chunkingVersion: MEMORY_CHUNKING_VERSION,
     ftsTokenizer: "unicode61",
+    provenanceVersion: MEMORY_INDEX_PROVENANCE_VERSION,
     ...overrides,
   };
 }
@@ -55,7 +60,35 @@ function createIdentityParams(
   };
 }
 
+function isMemoryIndexIdentityDirty(
+  params: Parameters<typeof resolveMemoryIndexIdentityState>[0],
+): boolean {
+  return resolveMemoryIndexIdentityState(params).status !== "valid";
+}
+
 describe("memory reindex state", () => {
+  it("invalidates indexes written before path provenance classification was versioned", () => {
+    expect(
+      resolveMemoryIndexIdentityState(
+        createIdentityParams({ meta: createMeta({ provenanceVersion: undefined }) }),
+      ),
+    ).toEqual({
+      status: "mismatched",
+      reason: "index provenance classifier changed",
+    });
+  });
+
+  it("invalidates indexes written before curated entry chunking was versioned", () => {
+    expect(
+      resolveMemoryIndexIdentityState(
+        createIdentityParams({ meta: createMeta({ chunkingVersion: undefined }) }),
+      ),
+    ).toEqual({
+      status: "mismatched",
+      reason: "index chunking implementation changed",
+    });
+  });
+
   it("retains the primary provider identity when its model is empty", () => {
     expect(
       resolveMemoryIndexProviderIdentities({
@@ -217,6 +250,54 @@ describe("memory reindex state", () => {
         createIdentityParams({
           meta: createMeta({ scopeHash: firstScopeHash }),
           configuredScopeHash: secondScopeHash,
+        }),
+      ),
+    ).toBe(true);
+  });
+
+  it("includes extra path patterns in stable scope identity", () => {
+    const workspaceDir = "/tmp/workspace";
+    const multimodal = {
+      enabled: false,
+      modalities: [],
+      maxFileBytes: 20 * 1024 * 1024,
+    };
+    const firstScopeHash = resolveConfiguredScopeHash({
+      workspaceDir,
+      extraPaths: [
+        { path: "notes", pattern: "runbooks/**/*.md" },
+        { path: "notes", pattern: "decisions/**/*.md" },
+      ],
+      multimodal,
+    });
+    const reorderedScopeHash = resolveConfiguredScopeHash({
+      workspaceDir,
+      extraPaths: [
+        { path: "notes", pattern: "decisions/**/*.md" },
+        { path: "notes", pattern: "runbooks/**/*.md" },
+      ],
+      multimodal,
+    });
+    const changedScopeHash = resolveConfiguredScopeHash({
+      workspaceDir,
+      extraPaths: [{ path: "notes", pattern: "archive/**/*.md" }],
+      multimodal,
+    });
+
+    expect(reorderedScopeHash).toBe(firstScopeHash);
+    expect(changedScopeHash).not.toBe(firstScopeHash);
+    expect(resolveConfiguredScopeHash({ workspaceDir, extraPaths: ["notes"], multimodal })).toBe(
+      resolveConfiguredScopeHash({
+        workspaceDir,
+        extraPaths: [{ path: "notes" }],
+        multimodal,
+      }),
+    );
+    expect(
+      isMemoryIndexIdentityDirty(
+        createIdentityParams({
+          meta: createMeta({ scopeHash: firstScopeHash }),
+          configuredScopeHash: changedScopeHash,
         }),
       ),
     ).toBe(true);

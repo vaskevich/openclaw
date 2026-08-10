@@ -1,12 +1,23 @@
 // Scans plugin manifest metadata without importing runtime entrypoints.
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import { normalizeOptionalString as normalizeTrimmedString } from "@openclaw/normalization-core/string-coerce";
+import { resolveRealpathOrAbsolute } from "../infra/boundary-path.js";
+import { resolveHomeRelativePath } from "../infra/home-dir.js";
+import { resolveOpenClawPackageRootSync } from "../infra/openclaw-root.js";
+import { readRegularFileSync } from "../infra/regular-file.js";
+import { createSubsystemLogger } from "../logging/subsystem.js";
 import { parseJsonWithJson5Fallback } from "../utils/parse-json-compat.js";
 import { resolveBundledPluginsDir } from "./bundled-dir.js";
+import { resolveDefaultPluginExtensionsDir } from "./install-paths.js";
 import { readPersistedInstalledPluginIndexSync } from "./installed-plugin-index-store.js";
+
+// Plugin manifest files are small metadata descriptors. Bound reads to prevent
+// a corrupted or hostile manifest from exhausting memory during metadata scan.
+const PLUGIN_MANIFEST_METADATA_MAX_BYTES = 256 * 1024;
+
+const log = createSubsystemLogger("plugins/manifest-metadata-scan");
 
 type PluginManifestMetadataRecord = {
   pluginDir: string;
@@ -29,23 +40,6 @@ let manifestMetadataCache:
     }
   | undefined;
 
-function resolveUserPath(value: string, env: NodeJS.ProcessEnv): string {
-  if (value === "~" || value.startsWith("~/")) {
-    const home = env.OPENCLAW_HOME ?? env.HOME ?? env.USERPROFILE ?? os.homedir();
-    return path.join(home, value.slice(2));
-  }
-  return path.resolve(value);
-}
-
-function resolveStateDir(env: NodeJS.ProcessEnv): string {
-  const override = normalizeTrimmedString(env.OPENCLAW_STATE_DIR);
-  if (override) {
-    return resolveUserPath(override, env);
-  }
-  const home = env.OPENCLAW_HOME ?? env.HOME ?? env.USERPROFILE ?? os.homedir();
-  return path.join(home, ".openclaw");
-}
-
 function listChildPluginDirs(
   root: string | undefined,
   rank: number,
@@ -58,7 +52,10 @@ function listChildPluginDirs(
   const dirs: CandidateDir[] = [];
   let order = startOrder;
   try {
-    for (const entry of fs.readdirSync(root, { withFileTypes: true })) {
+    const entries = fs
+      .readdirSync(root, { withFileTypes: true })
+      .toSorted((left, right) => (left.name < right.name ? -1 : left.name > right.name ? 1 : 0));
+    for (const entry of entries) {
       if (entry.isDirectory()) {
         dirs.push({ pluginDir: path.join(root, entry.name), rank, order: order++, origin });
       }
@@ -71,9 +68,18 @@ function listChildPluginDirs(
 
 function readJsonObject(filePath: string): Record<string, unknown> | undefined {
   try {
-    const parsed = parseJsonWithJson5Fallback(fs.readFileSync(filePath, "utf8"));
+    const { buffer } = readRegularFileSync({
+      filePath,
+      maxBytes: PLUGIN_MANIFEST_METADATA_MAX_BYTES,
+    });
+    const parsed = parseJsonWithJson5Fallback(buffer.toString("utf-8"));
     return isRecord(parsed) ? parsed : undefined;
-  } catch {
+  } catch (err) {
+    if (err instanceof Error && err.message.includes("exceeds")) {
+      log.warn(
+        `Ignoring oversized plugin manifest at ${filePath}: file exceeds the ${PLUGIN_MANIFEST_METADATA_MAX_BYTES}-byte limit`,
+      );
+    }
     return undefined;
   }
 }
@@ -106,7 +112,7 @@ function listPersistedIndexPluginDirs(env: NodeJS.ProcessEnv, startOrder: number
       continue;
     }
     dirs.push({
-      pluginDir: resolveUserPath(rootDir, env),
+      pluginDir: resolveHomeRelativePath(rootDir, { env }),
       rank: plugin.origin === "bundled" ? 3 : 1,
       order: order++,
       origin: normalizeTrimmedString(plugin.origin),
@@ -115,18 +121,45 @@ function listPersistedIndexPluginDirs(env: NodeJS.ProcessEnv, startOrder: number
   return dirs;
 }
 
-function resolveComparablePath(filePath: string): string {
-  try {
-    return fs.realpathSync(filePath);
-  } catch {
-    return path.resolve(filePath);
+function isSourceCheckoutRoot(packageRoot: string): boolean {
+  return (
+    fs.existsSync(path.join(packageRoot, "pnpm-workspace.yaml")) &&
+    fs.existsSync(path.join(packageRoot, "src")) &&
+    fs.existsSync(path.join(packageRoot, "extensions"))
+  );
+}
+
+function resolvePackageRootsForSourceManifestMetadata(): string[] {
+  const roots: string[] = [];
+  for (const params of [
+    { argv1: process.argv[1] },
+    { moduleUrl: import.meta.url },
+  ] satisfies Array<{ argv1?: string; moduleUrl?: string }>) {
+    const root = resolveOpenClawPackageRootSync(params);
+    if (root && !roots.includes(root)) {
+      roots.push(root);
+    }
   }
+  return roots;
+}
+
+function listSourceCheckoutPluginDirs(startOrder: number): CandidateDir[] {
+  const dirs: CandidateDir[] = [];
+  let order = startOrder;
+  for (const packageRoot of resolvePackageRootsForSourceManifestMetadata()) {
+    if (!isSourceCheckoutRoot(packageRoot)) {
+      continue;
+    }
+    dirs.push(...listChildPluginDirs(path.join(packageRoot, "extensions"), 3, order, "source"));
+    order = startOrder + dirs.length;
+  }
+  return dirs;
 }
 
 function uniqueCandidateDirs(candidates: CandidateDir[]): CandidateDir[] {
   const byPath = new Map<string, CandidateDir>();
   for (const candidate of candidates) {
-    const key = resolveComparablePath(candidate.pluginDir);
+    const key = resolveRealpathOrAbsolute(candidate.pluginDir);
     const existing = byPath.get(key);
     if (!existing || candidate.rank < existing.rank || candidate.order < existing.order) {
       byPath.set(key, candidate);
@@ -147,8 +180,10 @@ export function listOpenClawPluginManifestMetadata(
   order = candidates.length;
   candidates.push(...listChildPluginDirs(resolveBundledPluginsDir(env), 2, order, "bundled"));
   order = candidates.length;
+  candidates.push(...listSourceCheckoutPluginDirs(order));
+  order = candidates.length;
   candidates.push(
-    ...listChildPluginDirs(path.join(resolveStateDir(env), "extensions"), 4, order, "global"),
+    ...listChildPluginDirs(resolveDefaultPluginExtensionsDir(env), 4, order, "global"),
   );
 
   const uniqueCandidates = uniqueCandidateDirs(candidates);

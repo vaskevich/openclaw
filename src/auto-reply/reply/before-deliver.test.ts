@@ -2,9 +2,96 @@
 import { describe, expect, it } from "vitest";
 import { getReplyPayloadMetadata, setReplyPayloadMetadata } from "../reply-payload.js";
 import type { ReplyPayload } from "../types.js";
-import { createReplyDispatcher } from "./reply-dispatcher.js";
+import {
+  appendReplyDispatcherBeforeDeliverCancelled,
+  attachReplyDispatchUndeliveredFallback,
+  captureReplyDispatchDeliveryOutcome,
+  createReplyDispatcher,
+} from "./reply-dispatcher.js";
 
 describe("beforeDeliver in reply dispatcher", () => {
+  it("delivers the attached fallback when the primary payload is cancelled", async () => {
+    const delivered: string[] = [];
+    const primary: ReplyPayload = { text: "caption", mediaUrl: "/tmp/voice.ogg" };
+    attachReplyDispatchUndeliveredFallback(primary, { text: "caption" });
+    const outcome = captureReplyDispatchDeliveryOutcome(primary);
+    const dispatcher = createReplyDispatcher({
+      beforeDeliver: (payload) => (payload.mediaUrl ? null : payload),
+      deliver: async (payload) => {
+        delivered.push(payload.text ?? "");
+      },
+    });
+
+    expect(dispatcher.sendFinalReply(primary)).toBe(true);
+    dispatcher.markComplete();
+    await dispatcher.waitForIdle();
+
+    expect(delivered).toEqual(["caption"]);
+    await expect(outcome.promise).resolves.toBe("delivered");
+    expect(dispatcher.getCancelledCounts?.().final).toBe(0);
+  });
+
+  it("delivers the fallback when primary normalization is cancelled", async () => {
+    const delivered: ReplyPayload[] = [];
+    const primary: ReplyPayload = { text: "caption", mediaUrl: "/tmp/voice.ogg" };
+    attachReplyDispatchUndeliveredFallback(primary, { text: "caption" });
+    const dispatcher = createReplyDispatcher({
+      transformReplyPayload: (payload) => (payload.mediaUrl ? null : payload),
+      deliver: async (payload) => {
+        delivered.push(payload);
+      },
+    });
+
+    expect(dispatcher.sendFinalReply(primary)).toBe(true);
+    dispatcher.markComplete();
+    await dispatcher.waitForIdle();
+
+    expect(delivered).toEqual([{ text: "caption" }]);
+  });
+
+  it("delivers the attached fallback after a proven pre-transport failure", async () => {
+    const delivered: string[] = [];
+    const primary: ReplyPayload = { text: "caption", mediaUrl: "/tmp/voice.ogg" };
+    attachReplyDispatchUndeliveredFallback(primary, { text: "caption" });
+    const dispatcher = createReplyDispatcher({
+      deliver: async (payload) => {
+        if (payload.mediaUrl) {
+          throw Object.assign(new Error("connect failed"), {
+            code: "ECONNREFUSED",
+            syscall: "connect",
+          });
+        }
+        delivered.push(payload.text ?? "");
+      },
+    });
+
+    dispatcher.sendFinalReply(primary);
+    dispatcher.markComplete();
+    await dispatcher.waitForIdle();
+
+    expect(delivered).toEqual(["caption"]);
+    expect(dispatcher.getFailedCounts().final).toBe(0);
+  });
+
+  it("does not duplicate text after an ambiguous transport failure", async () => {
+    const delivered: string[] = [];
+    const primary: ReplyPayload = { text: "caption", mediaUrl: "/tmp/voice.ogg" };
+    attachReplyDispatchUndeliveredFallback(primary, { text: "caption" });
+    const dispatcher = createReplyDispatcher({
+      deliver: async (payload) => {
+        delivered.push(payload.text ?? "");
+        throw new Error("send outcome unknown");
+      },
+    });
+
+    dispatcher.sendFinalReply(primary);
+    dispatcher.markComplete();
+    await dispatcher.waitForIdle();
+
+    expect(delivered).toEqual(["caption"]);
+    expect(dispatcher.getFailedCounts().final).toBe(1);
+  });
+
   it("cancels delivery before queueing when transformReplyPayload returns null", async () => {
     const delivered: string[] = [];
 
@@ -58,6 +145,49 @@ describe("beforeDeliver in reply dispatcher", () => {
     expect(cancelled).toEqual(["blocked reply"]);
     expect(dispatcher.getQueuedCounts()).toEqual({ tool: 0, block: 0, final: 2 });
     expect(dispatcher.getCancelledCounts?.()).toEqual({ tool: 0, block: 0, final: 1 });
+  });
+
+  it("notifies appended cancellation observers when beforeDeliver returns null", async () => {
+    const delivered: string[] = [];
+    const cancelled: string[] = [];
+    const errors: string[] = [];
+
+    const dispatcher = createReplyDispatcher({
+      deliver: async (payload) => {
+        delivered.push(payload.text ?? "");
+      },
+      beforeDeliver: () => null,
+      onBeforeDeliverCancelled: (payload) => {
+        cancelled.push(`constructed:${payload.text ?? ""}`);
+      },
+      onError: (err) => {
+        errors.push(err instanceof Error ? err.message : String(err));
+      },
+    });
+    appendReplyDispatcherBeforeDeliverCancelled(dispatcher, (payload) => {
+      cancelled.push(`appended-a:${payload.text ?? ""}`);
+    });
+    appendReplyDispatcherBeforeDeliverCancelled(dispatcher, () => {
+      throw new Error("observer failed");
+    });
+    appendReplyDispatcherBeforeDeliverCancelled(dispatcher, (payload) => {
+      cancelled.push(`appended-b:${payload.text ?? ""}`);
+    });
+
+    dispatcher.sendFinalReply({ text: "blocked reply" });
+    dispatcher.markComplete();
+    await dispatcher.waitForIdle();
+
+    expect(delivered).toEqual([]);
+    expect(cancelled).toEqual([
+      "constructed:blocked reply",
+      "appended-a:blocked reply",
+      "appended-b:blocked reply",
+    ]);
+    expect(errors).toEqual(["observer failed"]);
+    expect(dispatcher.getQueuedCounts()).toEqual({ tool: 0, block: 0, final: 1 });
+    expect(dispatcher.getCancelledCounts?.()).toEqual({ tool: 0, block: 0, final: 1 });
+    expect(dispatcher.getFailedCounts?.()).toEqual({ tool: 0, block: 0, final: 0 });
   });
 
   it("notifies cancellation when beforeDeliver throws before delivery", async () => {

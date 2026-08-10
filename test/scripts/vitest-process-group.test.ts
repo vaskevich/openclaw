@@ -1,11 +1,14 @@
 // Vitest Process Group tests cover vitest process group script behavior.
+import { EventEmitter } from "node:events";
 import { describe, expect, it, vi } from "vitest";
 import {
+  createVitestProcessCompletion,
   forwardSignalToVitestProcessGroup,
   installVitestProcessGroupCleanup,
+  parseVitestProcessGroupMembers,
   resolveVitestProcessGroupSignalTarget,
   shouldUseDetachedVitestProcessGroup,
-} from "../../scripts/vitest-process-group.mjs";
+} from "../../scripts/vitest-process-group.mts";
 
 describe("vitest process group helpers", () => {
   function getListenerSet(listeners: Map<string, Set<() => void>>, event: string) {
@@ -38,6 +41,15 @@ describe("vitest process group helpers", () => {
     expect(resolveVitestProcessGroupSignalTarget({ childPid: undefined, platform: "darwin" })).toBe(
       null,
     );
+  });
+
+  it("formats bounded process-group diagnostics without command arguments", () => {
+    expect(
+      parseVitestProcessGroupMembers(
+        [" 116 1 116 Z node", " 117 1 116 Sl claude", " 118 1 999 S unrelated"].join("\n"),
+        116,
+      ),
+    ).toBe("pid=116 ppid=1 state=Z comm=node; pid=117 ppid=1 state=Sl comm=claude");
   });
 
   it("forwards signals to the computed target and ignores cleanup races", () => {
@@ -81,6 +93,24 @@ describe("vitest process group helpers", () => {
     ).toBe(false);
   });
 
+  it.each([
+    ["Windows", { detached: true, platform: "win32" as const }],
+    ["non-detached POSIX", { detached: false, platform: "darwin" as const }],
+  ])("keeps %s completion on direct-child exit", async (_label, params) => {
+    const child = Object.assign(new EventEmitter(), { pid: 4200 });
+    const kill = vi.fn(() => true as const);
+    const completion = createVitestProcessCompletion({
+      child: child as never,
+      kill,
+      ...params,
+    });
+
+    child.emit("exit", 0, null);
+
+    await expect(completion).resolves.toEqual({ code: 0, signal: null });
+    expect(kill).not.toHaveBeenCalled();
+  });
+
   it("installs and removes process cleanup listeners", () => {
     const listeners = new Map<string, Set<() => void>>();
     const fakeProcess = {
@@ -107,7 +137,7 @@ describe("vitest process group helpers", () => {
     expectListenerCount(listeners, "SIGTERM", 1);
     expectListenerCount(listeners, "exit", 1);
 
-    getListenerSet(listeners, "SIGTERM").values().next().value();
+    getListenerSet(listeners, "SIGTERM").values().next().value!();
     expect(onSignal).toHaveBeenCalledWith("SIGTERM");
     expect(kill).toHaveBeenCalledWith(-4200, "SIGTERM");
 
@@ -138,7 +168,7 @@ describe("vitest process group helpers", () => {
       kill,
     });
 
-    getListenerSet(listeners, "SIGTERM").values().next().value();
+    getListenerSet(listeners, "SIGTERM").values().next().value!();
     await Promise.resolve();
 
     expect(kill).toHaveBeenNthCalledWith(1, -4200, "SIGTERM");

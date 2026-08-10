@@ -6,13 +6,26 @@ import {
   listNodePairing,
   releaseNodePairingCleanupClaim,
   requestNodePairing,
-} from "../infra/node-pairing.js";
+} from "../infra/device-pairing-node.js";
+import { approveDevicePairing, requestDevicePairing } from "../infra/device-pairing.js";
 import { createSuiteTempRootTracker } from "../test-helpers/temp-dir.js";
 import { createNodeReapprovalCoordinator } from "./node-reapproval-coordinator.js";
 
 const tempDirs = createSuiteTempRootTracker({ prefix: "openclaw-node-reapproval-" });
 
 async function setupPairedNode(baseDir: string): Promise<void> {
+  // Node surfaces attach to paired devices, so device pairing comes first.
+  const devicePairing = await requestDevicePairing(
+    {
+      deviceId: "node-1",
+      publicKey: "pk-node-1",
+      role: "node",
+      roles: ["node"],
+      scopes: [],
+    },
+    baseDir,
+  );
+  await approveDevicePairing(devicePairing.request.requestId, { callerScopes: [] }, baseDir);
   const request = await requestNodePairing(
     {
       nodeId: "node-1",

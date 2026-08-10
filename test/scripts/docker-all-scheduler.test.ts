@@ -1,25 +1,43 @@
 // Docker All Scheduler tests cover docker all scheduler script behavior.
-import { spawn, spawnSync } from "node:child_process";
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
+import {
+  chmodSync,
+  copyFileSync,
+  cpSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { setTimeout as delay } from "node:timers/promises";
-import { describe, expect, it } from "vitest";
-import { DEFAULT_RESOURCE_LIMITS } from "../../scripts/lib/docker-e2e-plan.mjs";
+import { afterEach, describe, expect, it } from "vitest";
+import { parse } from "yaml";
+import { DEFAULT_RESOURCE_LIMITS } from "../../scripts/lib/docker-e2e-plan.mts";
 import {
   appendBoundedShellCapture,
+  buildLaneRerunCommand,
   canStartSchedulerLane,
   describeDockerSchedulerLimits,
   dockerPreflightContainerNames,
   dockerPreflightSmokeCommand,
+  githubWorkflowRerunCommand,
   LOG_TAIL_MAX_BYTES,
   parseDockerAllCliArgs,
   resolveDockerPreflightPlatform,
+  runCleanupSmokePhase,
   runShellCaptureCommand,
   runShellCommand,
   SHELL_CAPTURE_MAX_CHARS,
   tailFile,
-} from "../../scripts/test-docker-all.mjs";
+  validateDockerCandidateEnvironment,
+  writeRunSummary,
+} from "../../scripts/test-docker-all.mts";
+import { useAutoCleanupTempDirTracker } from "../helpers/temp-dir.js";
 import { createScriptTestHarness } from "./test-helpers.js";
 
 const limits = {
@@ -31,6 +49,65 @@ const limits = {
 };
 const posixIt = process.platform === "win32" ? it.skip : it;
 const { createTempDir } = createScriptTestHarness();
+const tempDirs = useAutoCleanupTempDirTracker(afterEach);
+const LIVE_E2E_WORKFLOW = ".github/workflows/openclaw-live-and-e2e-checks-reusable.yml";
+type DockerCandidatePlan = Parameters<typeof validateDockerCandidateEnvironment>[1];
+
+function candidatePlan({
+  needsPackage = true,
+  requiredPackages = [],
+}: {
+  needsPackage?: boolean;
+  requiredPackages?: string[];
+} = {}): DockerCandidatePlan {
+  return {
+    chunk: undefined,
+    credentials: [],
+    imageKinds: [],
+    includeOpenWebUI: false,
+    lanes: [],
+    mainLanes: [],
+    needs: {
+      bareImage: false,
+      e2eImage: needsPackage,
+      functionalImage: false,
+      liveImage: false,
+      package: needsPackage,
+      prepublishPluginRegistry: requiredPackages.length > 0,
+    },
+    omittedUnsupportedLanes: [],
+    profile: "all",
+    releaseProfile: "full",
+    requiredPrepublishPluginPackages: requiredPackages,
+    selectedLanes: [],
+    tailLanes: [],
+    version: 1,
+  };
+}
+
+function writeFrozenScenarioContract(root: string, scenarios: string[]): string {
+  const assertionsFile = path.join(root, "scripts/e2e/lib/upgrade-survivor/assertions.mjs");
+  mkdirSync(path.dirname(assertionsFile), { recursive: true });
+  writeFileSync(
+    assertionsFile,
+    `process.stdout.write(${JSON.stringify(`${JSON.stringify(scenarios)}\n`)});\n`,
+  );
+  return assertionsFile;
+}
+
+function expectDeclaredDispatchInputs(command: string): void {
+  const workflow = parse(readFileSync(LIVE_E2E_WORKFLOW, "utf8")) as {
+    on?: { workflow_dispatch?: { inputs?: Record<string, unknown> } };
+  };
+  const declared = new Set(Object.keys(workflow.on?.workflow_dispatch?.inputs ?? {}));
+  const emitted = [...command.matchAll(/(?:^|\s)-f\s+([a-z0-9_]+)=/gu)].flatMap((match) =>
+    match[1] === undefined ? [] : [match[1]],
+  );
+  expect(emitted.length).toBeGreaterThan(0);
+  for (const input of emitted) {
+    expect(declared.has(input), `undeclared workflow_dispatch input: ${input}`).toBe(true);
+  }
+}
 
 function activePool({
   count = 0,
@@ -45,6 +122,137 @@ function activePool({
     count,
     resources: new Map(Object.entries(resources)),
     weight,
+  };
+}
+
+function sha256(file: string) {
+  return createHash("sha256").update(readFileSync(file)).digest("hex");
+}
+
+function writePackageTarball(
+  root: string,
+  name: string,
+  version: string,
+  fileName = "openclaw.tgz",
+) {
+  const packageRoot = path.join(root, `package-${fileName}`);
+  const packageDir = path.join(packageRoot, "package");
+  mkdirSync(packageDir, { recursive: true });
+  writeFileSync(path.join(packageDir, "package.json"), JSON.stringify({ name, version }));
+  const tarball = path.join(root, fileName);
+  execFileSync("tar", ["-czf", tarball, "-C", packageRoot, "package"]);
+  return tarball;
+}
+
+function candidateFixture(packageName = "openclaw", packageVersion = "2026.8.1") {
+  const root = tempDirs.make("openclaw-docker-candidate-");
+  const version = "2026.8.1";
+  const packagePath = writePackageTarball(
+    tempDirs.make("openclaw-docker-package-"),
+    packageName,
+    packageVersion,
+  );
+  writeFileSync(
+    path.join(root, "package.json"),
+    JSON.stringify({
+      name: "openclaw",
+      version,
+      scripts: { "test:docker:gateway-network": "true" },
+    }),
+  );
+  writeFakePackScript(root, packagePath);
+  execFileSync("git", ["init", "-q"], { cwd: root });
+  execFileSync("git", ["add", "package.json", "scripts/package-openclaw-for-docker.mjs"], {
+    cwd: root,
+  });
+  execFileSync(
+    "git",
+    ["-c", "user.name=Test", "-c", "user.email=test@example.com", "commit", "-qm", "fixture"],
+    { cwd: root },
+  );
+  const sourceSha = execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: root,
+    encoding: "utf8",
+  }).trim();
+  return {
+    root,
+    sourceSha,
+    version,
+    packagePath,
+    env: {
+      OPENCLAW_DOCKER_E2E_SELECTED_SHA: sourceSha,
+      OPENCLAW_CURRENT_PACKAGE_TGZ: packagePath,
+      OPENCLAW_CURRENT_PACKAGE_VERSION: version,
+      OPENCLAW_CURRENT_PACKAGE_SHA256: sha256(packagePath),
+    },
+  };
+}
+
+function writeFakePackScript(root: string, sourceTarball: string) {
+  const script = path.join(root, "scripts/package-openclaw-for-docker.mjs");
+  mkdirSync(path.dirname(script), { recursive: true });
+  writeFileSync(
+    script,
+    `import fs from "node:fs"; import path from "node:path";
+const outputDir = process.argv[process.argv.indexOf("--output-dir") + 1];
+const outputName = process.argv[process.argv.indexOf("--output-name") + 1];
+fs.mkdirSync(outputDir, { recursive: true });
+fs.copyFileSync(${JSON.stringify(sourceTarball)}, path.join(outputDir, outputName));\n`,
+  );
+}
+
+function runCandidatePrep(fixture: ReturnType<typeof candidateFixture>) {
+  const manifestPath = path.join(fixture.root, "candidate.json");
+  const result = spawnSync(
+    process.execPath,
+    ["scripts/test-docker-all.mjs", `--prepare-only=${manifestPath}`],
+    {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        OPENCLAW_DOCKER_ALL_LANES: "gateway-network",
+        OPENCLAW_DOCKER_ALL_LOG_DIR: path.join(fixture.root, "logs"),
+        OPENCLAW_DOCKER_ALL_TIMINGS: "0",
+        OPENCLAW_DOCKER_E2E_REPO_ROOT: fixture.root,
+      },
+    },
+  );
+  return { manifestPath, result };
+}
+
+function addRegistry(
+  fixture: ReturnType<typeof candidateFixture>,
+  packageNames = ["@openclaw/discord", "@openclaw/feishu"],
+) {
+  const registryDir = path.join(fixture.root, "registry");
+  mkdirSync(registryDir);
+  const packages = packageNames.toSorted().map((name, index) => {
+    const tarball = `plugin-${String(index)}.tgz`;
+    const tarballPath = path.join(registryDir, tarball);
+    copyFileSync(writePackageTarball(fixture.root, name, fixture.version, tarball), tarballPath);
+    return { name, version: fixture.version, tarball, sha256: sha256(tarballPath) };
+  });
+  const manifestPath = path.join(registryDir, "prepublish-plugin-registry.json");
+  writeFileSync(
+    manifestPath,
+    `${JSON.stringify(
+      {
+        schema: "openclaw.prepublish-plugin-registry/v1",
+        schemaVersion: 1,
+        sourceSha: fixture.sourceSha,
+        candidateVersion: fixture.version,
+        packages,
+      },
+      null,
+      2,
+    )}\n`,
+  );
+  return {
+    ...fixture.env,
+    OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_DIR: registryDir,
+    OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_CANDIDATE_VERSION: fixture.version,
+    OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_MANIFEST_SHA256: sha256(manifestPath),
   };
 }
 
@@ -63,7 +271,7 @@ async function waitFor(predicate: () => boolean, timeoutMs = 5_000): Promise<voi
     if (predicate()) {
       return;
     }
-    await delay(25);
+    await delay(5);
   }
   throw new Error("condition was not met before timeout");
 }
@@ -96,6 +304,14 @@ describe("scripts/test-docker-all scheduler", () => {
       help: true,
       planJson: false,
     });
+    expect(parseDockerAllCliArgs(["--prepare-only=/tmp/candidate.json"])).toEqual({
+      help: false,
+      planJson: false,
+      prepareOnly: "/tmp/candidate.json",
+    });
+    expect(() =>
+      parseDockerAllCliArgs(["--plan-json", "--prepare-only=/tmp/candidate.json"]),
+    ).toThrow("conflicting plan/prep options");
   });
 
   it("prints CLI help without a stack trace", () => {
@@ -106,7 +322,7 @@ describe("scripts/test-docker-all scheduler", () => {
 
     expect(result.status).toBe(0);
     expect(result.stderr).toBe("");
-    expect(result.stdout).toContain("Usage: node scripts/test-docker-all.mjs [--plan-json]");
+    expect(result.stdout).toContain("--prepare-only=<manifest>");
     expect(result.stdout).toContain("OPENCLAW_DOCKER_ALL_* env vars");
   });
 
@@ -119,8 +335,256 @@ describe("scripts/test-docker-all scheduler", () => {
     expect(result.status).toBe(1);
     expect(result.stdout).toBe("");
     expect(result.stderr).toContain("unknown argument: --bogus");
-    expect(result.stderr).toContain("Usage: node scripts/test-docker-all.mjs [--plan-json]");
+    expect(result.stderr).toContain("--prepare-only=<manifest>");
     expect(result.stderr).not.toContain("at ");
+  });
+
+  it("writes a package-free prep-only manifest without Docker work", () => {
+    const root = tempDirs.make("openclaw-docker-package-free-");
+    const manifestPath = path.join(root, "candidate.json");
+    const result = spawnSync(
+      process.execPath,
+      ["scripts/test-docker-all.mjs", `--prepare-only=${manifestPath}`],
+      {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENCLAW_DOCKER_ALL_LANES: "live-gateway",
+          OPENCLAW_DOCKER_ALL_LOG_DIR: path.join(root, "logs"),
+          OPENCLAW_DOCKER_ALL_TIMINGS: "0",
+        },
+      },
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(manifestPath, "utf8"))).toMatchObject({
+      schemaVersion: 1,
+      candidate: null,
+    });
+    expect(result.stdout).not.toContain("Docker preflight");
+    expect(result.stdout).not.toContain("Build shared Docker images");
+  });
+
+  it("prepares one immutable package candidate before Docker work and rejects dirty source", () => {
+    const fixture = candidateFixture();
+    const { manifestPath, result } = runCandidatePrep(fixture);
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(readFileSync(manifestPath, "utf8"))).toMatchObject({
+      sourceSha: fixture.sourceSha,
+      candidate: {
+        package: {
+          name: "openclaw",
+          version: fixture.version,
+          sha256: sha256(fixture.packagePath),
+        },
+        registry: null,
+      },
+    });
+    expect(result.stdout).not.toContain("Docker preflight");
+    expect(result.stdout).not.toContain("Build shared Docker images");
+
+    writeFileSync(
+      path.join(fixture.root, "package.json"),
+      JSON.stringify({
+        name: "openclaw",
+        version: "dirty",
+        scripts: { "test:docker:gateway-network": "true" },
+      }),
+    );
+    const dirty = runCandidatePrep(fixture).result;
+    expect(dirty.status).toBe(1);
+    expect(dirty.stderr).toContain("working-tree changes");
+  });
+
+  it("rejects untracked source before package preparation", () => {
+    const fixture = candidateFixture();
+    writeFileSync(path.join(fixture.root, "untracked-source.ts"), "export {};\n");
+    const result = runCandidatePrep(fixture).result;
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("working-tree changes");
+  });
+
+  it.each([
+    { name: "wrong-name", packageName: "not-openclaw", version: "2026.8.1" },
+    { name: "wrong-version", packageName: "openclaw", version: "0.0.0" },
+  ])("rejects a $name packed candidate", ({ packageName, version }) => {
+    const fixture = candidateFixture(packageName, version);
+    const result = runCandidatePrep(fixture).result;
+    expect(result.status).toBe(1);
+    expect(result.stderr).toContain("name or version");
+  });
+
+  it("validates complete candidate fields against HEAD and tarball bytes", () => {
+    const fixture = candidateFixture();
+    const plan = candidatePlan();
+    expect(() => validateDockerCandidateEnvironment({}, plan, fixture.root)).not.toThrow();
+    expect(() => validateDockerCandidateEnvironment(fixture.env, plan, fixture.root)).not.toThrow();
+    expect(() =>
+      validateDockerCandidateEnvironment(
+        { OPENCLAW_CURRENT_PACKAGE_TGZ: fixture.packagePath },
+        plan,
+        fixture.root,
+      ),
+    ).not.toThrow();
+    for (const field of [
+      "OPENCLAW_CURRENT_PACKAGE_VERSION",
+      "OPENCLAW_CURRENT_PACKAGE_SHA256",
+    ] as const) {
+      const env: NodeJS.ProcessEnv = { ...fixture.env };
+      delete env[field];
+      expect(() => validateDockerCandidateEnvironment(env, plan, fixture.root)).toThrow(
+        "must be complete",
+      );
+    }
+    for (const env of [
+      { ...fixture.env, OPENCLAW_CURRENT_PACKAGE_TGZ: "relative.tgz" },
+      { ...fixture.env, OPENCLAW_DOCKER_E2E_SELECTED_SHA: "a".repeat(40) },
+      { ...fixture.env, OPENCLAW_CURRENT_PACKAGE_SHA256: "b".repeat(64) },
+      { ...fixture.env, OPENCLAW_CURRENT_PACKAGE_VERSION: "0.0.0" },
+    ]) {
+      expect(() => validateDockerCandidateEnvironment(env, plan, fixture.root)).toThrow();
+    }
+  });
+
+  it("preserves legacy release package and registry inputs", () => {
+    const fixture = candidateFixture();
+    const registryDir = path.join(fixture.root, "registry");
+    const env: NodeJS.ProcessEnv = addRegistry(fixture);
+    delete env.OPENCLAW_CURRENT_PACKAGE_VERSION;
+    delete env.OPENCLAW_CURRENT_PACKAGE_SHA256;
+    env.OPENCLAW_CURRENT_PACKAGE_TGZ = path.relative(process.cwd(), fixture.packagePath);
+    env.OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_DIR = path.relative(process.cwd(), registryDir);
+
+    expect(() =>
+      validateDockerCandidateEnvironment(
+        env,
+        candidatePlan({ requiredPackages: ["@openclaw/discord"] }),
+        fixture.root,
+      ),
+    ).not.toThrow();
+    expect(env.OPENCLAW_CURRENT_PACKAGE_TGZ).toBe(fixture.packagePath);
+    expect(env.OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_DIR).toBe(registryDir);
+  });
+
+  it("does not inspect package files for package-free plans", () => {
+    const fixture = candidateFixture();
+    expect(() =>
+      validateDockerCandidateEnvironment(
+        { ...fixture.env, OPENCLAW_CURRENT_PACKAGE_TGZ: path.join(fixture.root, "missing.tgz") },
+        candidatePlan({ needsPackage: false }),
+        fixture.root,
+      ),
+    ).not.toThrow();
+  });
+
+  it("validates complete registry tuples as plan-specific subsets", () => {
+    const fixture = candidateFixture();
+    const env = addRegistry(fixture);
+    expect(() =>
+      validateDockerCandidateEnvironment(
+        env,
+        candidatePlan({ requiredPackages: ["@openclaw/discord"] }),
+        fixture.root,
+      ),
+    ).not.toThrow();
+    expect(() =>
+      validateDockerCandidateEnvironment(env, candidatePlan(), fixture.root),
+    ).not.toThrow();
+    expect(() =>
+      validateDockerCandidateEnvironment(
+        fixture.env,
+        candidatePlan({ requiredPackages: ["@openclaw/discord"] }),
+        fixture.root,
+      ),
+    ).toThrow("requires a prepublish plugin registry tuple");
+    expect(() =>
+      validateDockerCandidateEnvironment(
+        { ...fixture.env, OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_DIR: "/tmp/partial" },
+        candidatePlan(),
+        fixture.root,
+      ),
+    ).toThrow("must be complete");
+    writeFileSync(path.join(env.OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_DIR, "extra"), "extra");
+    expect(() => validateDockerCandidateEnvironment(env, candidatePlan(), fixture.root)).toThrow(
+      "missing, extra, or non-file",
+    );
+  });
+
+  it("serializes complete candidate and registry tuples in lane reruns", () => {
+    const fixture = candidateFixture();
+    const env = addRegistry(fixture);
+    const command = buildLaneRerunCommand("gateway-network", env);
+    for (const key of [
+      "OPENCLAW_DOCKER_E2E_SELECTED_SHA",
+      "OPENCLAW_CURRENT_PACKAGE_TGZ",
+      "OPENCLAW_CURRENT_PACKAGE_VERSION",
+      "OPENCLAW_CURRENT_PACKAGE_SHA256",
+      "OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_DIR",
+      "OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_CANDIDATE_VERSION",
+      "OPENCLAW_PREPUBLISH_PLUGIN_REGISTRY_MANIFEST_SHA256",
+    ] as const) {
+      expect(command).toContain(`${key}='${env[key]}'`);
+    }
+  });
+
+  it("plans from an isolated release harness with source-checkout TypeScript support", () => {
+    const artifactRoot = path.resolve(".artifacts");
+    mkdirSync(artifactRoot, { recursive: true });
+    const root = tempDirs.make("openclaw-docker-plan-isolated-harness-", artifactRoot);
+    const scriptsDir = path.join(root, "scripts");
+    const libDir = path.join(scriptsDir, "lib");
+    const upgradeSurvivorDir = path.join(scriptsDir, "e2e/lib/upgrade-survivor");
+    mkdirSync(libDir, { recursive: true });
+    mkdirSync(upgradeSurvivorDir, { recursive: true });
+    copyFileSync("package.json", path.join(root, "package.json"));
+    copyFileSync("scripts/test-docker-all.mjs", path.join(scriptsDir, "test-docker-all.mjs"));
+    copyFileSync("scripts/test-docker-all.mts", path.join(scriptsDir, "test-docker-all.mts"));
+    copyFileSync("scripts/lib/tsx-cli-shim.mjs", path.join(libDir, "tsx-cli-shim.mjs"));
+    copyFileSync(
+      "scripts/prepublish-plugin-registry-artifact.mjs",
+      path.join(scriptsDir, "prepublish-plugin-registry-artifact.mjs"),
+    );
+    copyFileSync(
+      "scripts/windows-cmd-helpers.mjs",
+      path.join(scriptsDir, "windows-cmd-helpers.mjs"),
+    );
+    for (const fileName of [
+      "docker-e2e-plan.mts",
+      "docker-e2e-scenarios.mts",
+      "official-external-channel-catalog.json",
+      "release-version.mjs",
+      "sleep.mjs",
+    ]) {
+      copyFileSync(path.join("scripts/lib", fileName), path.join(libDir, fileName));
+    }
+    copyFileSync(
+      "scripts/e2e/lib/upgrade-survivor/config-recipe.mts",
+      path.join(upgradeSurvivorDir, "config-recipe.mts"),
+    );
+    cpSync(
+      "scripts/e2e/lib/upgrade-survivor/config-recipe",
+      path.join(upgradeSurvivorDir, "config-recipe"),
+      { recursive: true },
+    );
+
+    const result = spawnSync(
+      process.execPath,
+      [path.join(scriptsDir, "test-docker-all.mjs"), "--plan-json"],
+      {
+        cwd: root,
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENCLAW_DOCKER_ALL_PLAN_RELEASE_ALL: "1",
+          OPENCLAW_DOCKER_ALL_PROFILE: "release-path",
+          OPENCLAW_UPGRADE_SURVIVOR_TARGET_ROOT: process.cwd(),
+        },
+      },
+    );
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(JSON.parse(result.stdout)).toMatchObject({ profile: "release-path" });
   });
 
   it("rejects loose numeric runner env vars without a stack trace", () => {
@@ -137,6 +601,110 @@ describe("scripts/test-docker-all scheduler", () => {
     expect(result.stdout).toBe("");
     expect(result.stderr).toContain("OPENCLAW_DOCKER_ALL_PARALLELISM must be a positive integer");
     expect(result.stderr).not.toContain("at ");
+  });
+
+  it("selects the CLI installer distribution lane through the scheduler catalog", () => {
+    const result = spawnSync(process.execPath, ["scripts/test-docker-all.mjs"], {
+      cwd: process.cwd(),
+      encoding: "utf8",
+      env: {
+        ...process.env,
+        OPENCLAW_DOCKER_ALL_BUILD: "0",
+        OPENCLAW_DOCKER_ALL_DRY_RUN: "1",
+        OPENCLAW_DOCKER_ALL_LANES: "cli-installer-distribution",
+        OPENCLAW_DOCKER_ALL_PREFLIGHT: "0",
+        OPENCLAW_DOCKER_ALL_TIMINGS: "0",
+      },
+    });
+
+    expect(result.status, result.stderr).toBe(0);
+    expect(result.stdout).toContain("Selected lanes: cli-installer-distribution");
+    expect(result.stdout).toContain(
+      "cli-installer-distribution(w=3 r=docker,npm timeout=1800s image=bare state=empty)",
+    );
+    expect(result.stdout).toContain("Dry run complete");
+  });
+
+  it("reuses only registry-backed images in generated workflow reruns", () => {
+    const localCommand = githubWorkflowRerunCommand(["install-e2e"], "a".repeat(40), {
+      GITHUB_REF_NAME: "full-release-validation-temp-deleted",
+      GITHUB_RUN_ID: "12345",
+      OPENCLAW_DOCKER_E2E_BARE_IMAGE: "openclaw-docker-e2e-bare:local",
+      OPENCLAW_DOCKER_E2E_FUNCTIONAL_IMAGE: "openclaw-docker-e2e-functional:local",
+      OPENCLAW_DOCKER_E2E_PACKAGE_ARTIFACT_NAME: "docker-e2e-package",
+    });
+    expect(localCommand).not.toContain("--ref 'full-release-validation-temp-deleted'");
+    expect(localCommand).not.toContain("package_artifact_run_id=");
+    expect(localCommand).not.toContain("package_artifact_name=");
+    expect(localCommand).not.toContain("docker_e2e_bare_image=");
+    expect(localCommand).not.toContain("docker_e2e_functional_image=");
+    expect(localCommand).not.toContain("shared_image_policy=existing-only");
+    expectDeclaredDispatchInputs(localCommand);
+
+    const registryCommand = githubWorkflowRerunCommand(["install-e2e"], "b".repeat(40), {
+      OPENCLAW_DOCKER_E2E_BARE_IMAGE: "ghcr.io/openclaw/openclaw-docker-e2e-bare:test",
+      OPENCLAW_DOCKER_E2E_FUNCTIONAL_IMAGE: "ghcr.io/openclaw/openclaw-docker-e2e-functional:test",
+      OPENCLAW_DOCKER_E2E_ALLOW_UNRELEASED_CHANGELOG: "true",
+      OPENCLAW_DOCKER_E2E_WORKFLOW_REF: "main",
+      OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SPEC: "openclaw@2026.5.3",
+      OPENCLAW_UPGRADE_SURVIVOR_BASELINE_SPECS: "openclaw@2026.5.3 openclaw@2026.5.2",
+      OPENCLAW_UPGRADE_SURVIVOR_SCENARIOS: "plugin-dependency-cleanup",
+    });
+    expect(registryCommand).toContain("--ref 'main'");
+    expect(registryCommand).toContain(
+      "docker_e2e_bare_image='ghcr.io/openclaw/openclaw-docker-e2e-bare:test'",
+    );
+    expect(registryCommand).toContain(
+      "docker_e2e_functional_image='ghcr.io/openclaw/openclaw-docker-e2e-functional:test'",
+    );
+    expect(registryCommand).toContain("shared_image_policy=existing-only");
+    expect(registryCommand).toContain("allow_unreleased_changelog=true");
+    expectDeclaredDispatchInputs(registryCommand);
+  });
+
+  it("preserves ephemeral package intent in generated summary and failure reruns", async () => {
+    const logDir = createTempDir("openclaw-docker-all-rerun-intent-");
+    try {
+      const selectedSha = "c".repeat(40);
+      await writeRunSummary(
+        logDir,
+        {
+          failures: [{ name: "install-e2e", status: 1 }],
+          lanes: [],
+          status: "failed",
+        },
+        {
+          ...process.env,
+          OPENCLAW_DOCKER_E2E_ALLOW_UNRELEASED_CHANGELOG: "true",
+          OPENCLAW_DOCKER_E2E_SELECTED_SHA: selectedSha,
+        },
+      );
+
+      const summaryFile = path.join(logDir, "summary.json");
+      const summary = JSON.parse(readFileSync(summaryFile, "utf8"));
+      expect(summary.allowUnreleasedChangelog).toBe(true);
+
+      const failureIndexFile = path.join(logDir, "failures.json");
+      const failureIndex = JSON.parse(readFileSync(failureIndexFile, "utf8"));
+      expect(failureIndex.combinedGhWorkflowCommand).toContain("allow_unreleased_changelog=true");
+
+      for (const artifact of [summaryFile, failureIndexFile]) {
+        const rerun = spawnSync(
+          process.execPath,
+          ["--import", "tsx", "scripts/docker-e2e-rerun.mts", artifact],
+          {
+            cwd: process.cwd(),
+            encoding: "utf8",
+            env: process.env,
+          },
+        );
+        expect(rerun.status, rerun.stderr).toBe(0);
+        expect(rerun.stdout).toContain(`-f ref='${selectedSha}'`);
+        expect(rerun.stdout).toContain("allow_unreleased_changelog=true");
+      }
+    } finally {
+      rmSync(logDir, { force: true, recursive: true });
+    }
   });
 
   it("rejects loose numeric resource limit env vars before scheduling lanes", () => {
@@ -196,12 +764,154 @@ describe("scripts/test-docker-all scheduler", () => {
     }
   });
 
-  posixIt("writes Docker run artifacts when cleanup smoke fails", () => {
+  it("rejects candidate-controlled survivor omissions without trusted opt-in", () => {
+    const root = tempDirs.make("openclaw-docker-all-untrusted-filter-");
+    try {
+      const assertionsFile = writeFrozenScenarioContract(root, ["unrelated"]);
+      const executionMarker = path.join(root, "candidate-contract-executed");
+      writeFileSync(
+        assertionsFile,
+        [
+          'import { writeFileSync } from "node:fs";',
+          `writeFileSync(${JSON.stringify(executionMarker)}, "executed");`,
+          'process.stdout.write("[\\"unrelated\\"]\\n");',
+        ].join("\n"),
+      );
+      const result = spawnSync(process.execPath, ["scripts/test-docker-all.mjs"], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENCLAW_ALLOW_FROZEN_TARGET_SCENARIO_OMISSIONS: "0",
+          OPENCLAW_DOCKER_ALL_DRY_RUN: "1",
+          OPENCLAW_DOCKER_ALL_LANES: "published-upgrade-survivor",
+          OPENCLAW_DOCKER_ALL_TIMINGS: "0",
+          OPENCLAW_UPGRADE_SURVIVOR_TARGET_ROOT: root,
+        },
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stderr).toContain("require trusted workflow opt-in");
+      expect(result.stdout).not.toContain("Dry run complete");
+      expect(existsSync(executionMarker)).toBe(false);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  it("fails with truthful artifacts when a frozen target cannot run selected survivor lanes", () => {
+    const root = tempDirs.make("openclaw-docker-all-filtered-");
+    const logDir = path.join(root, "logs");
+    try {
+      writeFrozenScenarioContract(root, ["unrelated"]);
+      const result = spawnSync(process.execPath, ["scripts/test-docker-all.mjs"], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENCLAW_ALLOW_FROZEN_TARGET_SCENARIO_OMISSIONS: "1",
+          OPENCLAW_DOCKER_ALL_BUILD: "0",
+          OPENCLAW_DOCKER_ALL_LANES: "published-upgrade-survivor",
+          OPENCLAW_DOCKER_ALL_LOG_DIR: logDir,
+          OPENCLAW_DOCKER_ALL_TIMINGS: "0",
+          OPENCLAW_UPGRADE_SURVIVOR_SCENARIOS: "reported-issues",
+          OPENCLAW_UPGRADE_SURVIVOR_TARGET_ROOT: root,
+        },
+      });
+
+      expect(result.status).toBe(1);
+      expect(result.stdout).toContain("Docker lanes omitted");
+      expect(result.stderr).toContain("resolved zero runnable Docker lanes");
+      expect(result.stderr).toContain("published-upgrade-survivor");
+      const summary = JSON.parse(readFileSync(path.join(logDir, "summary.json"), "utf8"));
+      expect(summary.status).toBe("failed");
+      expect(summary.lanes).toEqual([]);
+      expect(summary.omittedUnsupportedLanes).toHaveLength(12);
+      expect(summary.omittedUnsupportedLanes).toContain("published-upgrade-survivor");
+      expect(summary.omittedUnsupportedLanes).toContain(
+        "published-upgrade-survivor-versioned-runtime-deps",
+      );
+      const failures = JSON.parse(readFileSync(path.join(logDir, "failures.json"), "utf8"));
+      expect(failures.status).toBe("failed");
+      expect(failures.lanes).toEqual([]);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  it.each([
+    { args: ["--plan-json"], dryRun: false, label: "JSON planning" },
+    { args: [], dryRun: true, label: "dry runs" },
+  ])("preserves $label when frozen survivor lanes are omitted", ({ args, dryRun }) => {
+    const root = tempDirs.make("openclaw-docker-all-filtered-plan-");
+    const logDir = path.join(root, "logs");
+    try {
+      writeFrozenScenarioContract(root, ["unrelated"]);
+      const result = spawnSync(process.execPath, ["scripts/test-docker-all.mjs", ...args], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENCLAW_ALLOW_FROZEN_TARGET_SCENARIO_OMISSIONS: "1",
+          OPENCLAW_DOCKER_ALL_BUILD: "0",
+          OPENCLAW_DOCKER_ALL_DRY_RUN: dryRun ? "1" : "0",
+          OPENCLAW_DOCKER_ALL_LANES: "published-upgrade-survivor",
+          OPENCLAW_DOCKER_ALL_LOG_DIR: logDir,
+          OPENCLAW_DOCKER_ALL_TIMINGS: "0",
+          OPENCLAW_UPGRADE_SURVIVOR_SCENARIOS: "reported-issues",
+          OPENCLAW_UPGRADE_SURVIVOR_TARGET_ROOT: root,
+        },
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+      if (dryRun) {
+        expect(result.stdout).toContain("Docker lanes omitted");
+        expect(result.stdout).toContain("Dry run complete");
+      } else {
+        const plan = JSON.parse(result.stdout);
+        expect(plan.lanes).toEqual([]);
+        expect(plan.omittedUnsupportedLanes).toHaveLength(12);
+      }
+      expect(existsSync(path.join(logDir, "summary.json"))).toBe(false);
+      expect(existsSync(path.join(logDir, "failures.json"))).toBe(false);
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  it("reports omitted frozen-target lanes when another selected lane remains runnable", () => {
+    const root = tempDirs.make("openclaw-docker-all-mixed-filtered-");
+    try {
+      writeFrozenScenarioContract(root, ["unrelated"]);
+      const result = spawnSync(process.execPath, ["scripts/test-docker-all.mjs"], {
+        cwd: process.cwd(),
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          OPENCLAW_ALLOW_FROZEN_TARGET_SCENARIO_OMISSIONS: "1",
+          OPENCLAW_DOCKER_ALL_DRY_RUN: "1",
+          OPENCLAW_DOCKER_ALL_LANES: "published-upgrade-survivor,plugin-binding-command-escape",
+          OPENCLAW_DOCKER_ALL_TIMINGS: "0",
+          OPENCLAW_UPGRADE_SURVIVOR_SCENARIOS: "reported-issues",
+          OPENCLAW_UPGRADE_SURVIVOR_TARGET_ROOT: root,
+        },
+      });
+
+      expect(result.status, result.stderr).toBe(0);
+      expect(result.stdout).toContain("Docker lanes omitted");
+      expect(result.stdout).toContain("published-upgrade-survivor");
+      expect(result.stdout).toContain("plugin-binding-command-escape");
+    } finally {
+      rmSync(root, { force: true, recursive: true });
+    }
+  });
+
+  posixIt("writes Docker run artifacts when cleanup smoke fails", async () => {
     const root = mkdtempSync(`${tmpdir()}/openclaw-docker-all-cleanup-`);
     const logDir = path.join(root, "logs");
-    const packageTgz = path.join(root, "openclaw-current.tgz");
     const fakePnpm = path.join(root, "pnpm");
-    writeFileSync(packageTgz, "fake package\n", "utf8");
+    const phases: Array<Record<string, unknown>> = [];
+    mkdirSync(logDir, { recursive: true });
     writeFileSync(
       fakePnpm,
       `#!/usr/bin/env node
@@ -217,27 +927,29 @@ process.exit(0);
     chmodSync(fakePnpm, 0o755);
 
     try {
-      const result = spawnSync(process.execPath, ["scripts/test-docker-all.mjs"], {
-        cwd: process.cwd(),
-        encoding: "utf8",
-        env: {
-          ...process.env,
-          OPENCLAW_CURRENT_PACKAGE_TGZ: packageTgz,
-          OPENCLAW_DOCKER_ALL_BUILD: "0",
-          OPENCLAW_DOCKER_ALL_LIVE_MODE: "skip",
-          OPENCLAW_DOCKER_ALL_LOG_DIR: logDir,
-          OPENCLAW_DOCKER_ALL_PARALLELISM: "16",
-          OPENCLAW_DOCKER_ALL_PREFLIGHT: "0",
-          OPENCLAW_DOCKER_ALL_START_STAGGER_MS: "0",
-          OPENCLAW_DOCKER_ALL_STATUS_INTERVAL_MS: "0",
-          OPENCLAW_DOCKER_ALL_TAIL_PARALLELISM: "16",
-          OPENCLAW_DOCKER_ALL_TIMINGS: "0",
-          PATH: `${root}${path.delimiter}${process.env.PATH ?? ""}`,
+      const baseEnv = {
+        ...process.env,
+        OPENCLAW_DOCKER_E2E_IMAGE: "openclaw-test-image",
+        PATH: `${root}${path.delimiter}${process.env.PATH ?? ""}`,
+      };
+      const cleanupFailure = await runCleanupSmokePhase(baseEnv, logDir, phases);
+      expect(cleanupFailure).toMatchObject({ name: "cleanup-smoke", status: 42 });
+      if (!cleanupFailure) {
+        throw new Error("expected cleanup smoke failure");
+      }
+      await writeRunSummary(logDir, {
+        failures: [cleanupFailure],
+        image: baseEnv.OPENCLAW_DOCKER_E2E_IMAGE,
+        images: {
+          bare: "openclaw-test-bare",
+          functional: "openclaw-test-image",
         },
+        lanes: [],
+        phases,
+        profile: "local",
+        startedAt: new Date().toISOString(),
+        status: "failed",
       });
-
-      expect(result.status).toBe(1);
-      expect(result.stderr).toContain("cleanup smoke failed intentionally");
 
       const summary = JSON.parse(readFileSync(path.join(logDir, "summary.json"), "utf8"));
       expect(summary.status).toBe("failed");
@@ -519,8 +1231,8 @@ postgres Created
       )}`,
       env: process.env,
       label: "oversized-capture-timeout",
-        timeoutKillGraceMs: Number.MAX_SAFE_INTEGER,
-        timeoutMs: Number.MAX_SAFE_INTEGER,
+      timeoutKillGraceMs: Number.MAX_SAFE_INTEGER,
+      timeoutMs: Number.MAX_SAFE_INTEGER,
     });
 
     expect(result).toMatchObject({
@@ -560,7 +1272,7 @@ setInterval(() => {}, 1000);
         env: process.env,
         label: "timeout-leader-exits",
         timeoutKillGraceMs: 25,
-        timeoutMs: 1_000,
+        timeoutMs: 250,
       });
 
       await waitFor(() => existsSync(grandchildPidPath));
@@ -608,7 +1320,7 @@ setInterval(() => {}, 1000);
       command: `exec ${JSON.stringify(process.execPath)} ${JSON.stringify(scriptPath)}`,
       env: process.env,
       label: "oversized-timeout-grace",
-        timeoutKillGraceMs: Number.MAX_SAFE_INTEGER,
+      timeoutKillGraceMs: Number.MAX_SAFE_INTEGER,
       timeoutMs: 500,
     });
 
@@ -730,12 +1442,17 @@ setInterval(() => {}, 1000);
 `,
       "utf8",
     );
+    // Preserve the production 10s grace while accelerating only this spawned proof's clock.
     writeFileSync(
       runnerPath,
       `
-import { runShellCommand } from ${JSON.stringify(
-        new URL("../../scripts/test-docker-all.mjs", import.meta.url).href,
-      )};
+const realNow = Date.now.bind(Date);
+const startedAt = realNow();
+Date.now = () => startedAt + (realNow() - startedAt) * 100;
+
+const { runShellCommand } = await import(${JSON.stringify(
+        new URL("../../scripts/test-docker-all.mts", import.meta.url).href,
+      )});
 
 await runShellCommand({
   command: ${JSON.stringify(`exec ${JSON.stringify(process.execPath)} ${JSON.stringify(leaderPath)}`)},
@@ -773,7 +1490,7 @@ await runShellCommand({
     );
 
     try {
-      runner = spawn(process.execPath, [runnerPath], {
+      runner = spawn(process.execPath, ["--import", "tsx", runnerPath], {
         cwd: process.cwd(),
         stdio: ["ignore", "ignore", "pipe"],
       });

@@ -9,7 +9,7 @@ import { pathToFileURL } from "node:url";
 import { promisify } from "node:util";
 import { formatErrorMessage } from "../../src/infra/errors.ts";
 import { createPluginStateKeyedStore } from "../../src/plugin-state/plugin-state-store.ts";
-import { readBoundedResponseText } from "../lib/bounded-response.ts";
+import { readBoundedResponseText } from "../lib/bounded-response.mjs";
 import {
   maskIdentifier,
   parseStrictIntegerOption,
@@ -17,6 +17,7 @@ import {
   redactForDevToolLog,
   redactHomePath,
 } from "../lib/dev-tooling-safety.ts";
+import { sleep } from "../lib/sleep.mjs";
 
 function writeStdoutLine(message: string): void {
   process.stdout.write(`${message}\n`);
@@ -157,12 +158,6 @@ class CliArgumentError extends Error {
   override name = "CliArgumentError";
 }
 
-function sleep(ms: number): Promise<void> {
-  return new Promise((resolve) => {
-    setTimeout(resolve, ms);
-  });
-}
-
 function remainingTimeoutMs(deadlineMs: number, nowMs = Date.now()): number {
   const remaining = Math.floor(deadlineMs - nowMs);
   if (!Number.isFinite(deadlineMs) || remaining <= 0) {
@@ -288,7 +283,7 @@ function validateCliArgs(argv: string[]): void {
       continue;
     }
     if (arg.startsWith("--") && arg.includes("=")) {
-      const [flag] = arg.split("=", 1);
+      const flag = arg.slice(0, arg.indexOf("="));
       if (VALUE_OPTIONS.has(flag)) {
         continue;
       }

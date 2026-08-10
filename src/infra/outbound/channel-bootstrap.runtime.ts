@@ -2,22 +2,61 @@
 // when only setup-shell metadata is active.
 import { resolveAgentWorkspaceDir, resolveDefaultAgentId } from "../../agents/agent-scope.js";
 import { applyPluginAutoEnable } from "../../config/plugin-auto-enable.js";
+import { resolveRuntimeConfigCacheKey } from "../../config/runtime-snapshot.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { resolveRuntimePluginRegistry } from "../../plugins/loader.js";
+import { withActivatedPluginIds } from "../../plugins/activation-context.js";
+import { resolveDiscoverableScopedChannelPluginIds } from "../../plugins/channel-plugin-ids.js";
+import { loadPluginRegistryHandle } from "../../plugins/loader.js";
 import type { PluginChannelRegistration } from "../../plugins/registry-types.js";
-import {
-  getActivePluginChannelRegistry,
-  getActivePluginChannelRegistryVersion,
-  getActivePluginRegistry,
-  getActivePluginRegistryVersion,
-} from "../../plugins/runtime.js";
-import type { DeliverableMessageChannel } from "../../utils/message-channel.js";
+import type { PluginRegistry } from "../../plugins/registry.js";
+import { getActivePluginRegistry, getActivePluginRegistryVersion } from "../../plugins/runtime.js";
+import { pruneMapToMaxSize } from "../map-size.js";
 
-const bootstrapAttempts = new Set<string>();
+const MAX_BOOTSTRAP_CONFIG_GENERATIONS = 64;
+const MAX_BOOTSTRAP_CHANNEL_OUTCOMES_PER_CONFIG = 64;
+let bootstrapRegistryGeneration: string | undefined;
+const bootstrapRegistriesByConfig = new Map<string, Map<string, PluginRegistry | null>>();
 
-/** Clears the per-registry channel bootstrap retry guard for isolated tests. */
+function cacheBootstrapOutcome(
+  registries: Map<string, PluginRegistry | null>,
+  channel: string,
+  outcome: PluginRegistry | null,
+): void {
+  // Reinsert every outcome, including null, so reads and writes share LRU ordering.
+  registries.delete(channel);
+  registries.set(channel, outcome);
+  pruneMapToMaxSize(registries, MAX_BOOTSTRAP_CHANNEL_OUTCOMES_PER_CONFIG);
+}
+
+function resolveBootstrapRegistryGeneration(): string {
+  return String(getActivePluginRegistryVersion());
+}
+
+function resolveBootstrapRegistries(cfg: OpenClawConfig): Map<string, PluginRegistry | null> {
+  const registryGeneration = resolveBootstrapRegistryGeneration();
+  if (registryGeneration !== bootstrapRegistryGeneration) {
+    bootstrapRegistryGeneration = registryGeneration;
+    bootstrapRegistriesByConfig.clear();
+  }
+  const configKey = resolveRuntimeConfigCacheKey(cfg);
+  const existing = bootstrapRegistriesByConfig.get(configKey);
+  if (existing) {
+    bootstrapRegistriesByConfig.delete(configKey);
+    bootstrapRegistriesByConfig.set(configKey, existing);
+    return existing;
+  }
+  // Agent-scoped configs may interleave within one registry generation. Keep a
+  // bounded LRU so one caller cannot evict another on every delivery attempt.
+  pruneMapToMaxSize(bootstrapRegistriesByConfig, MAX_BOOTSTRAP_CONFIG_GENERATIONS - 1);
+  const registries = new Map<string, PluginRegistry | null>();
+  bootstrapRegistriesByConfig.set(configKey, registries);
+  return registries;
+}
+
+/** Clears the per-generation channel bootstrap handle cache for isolated tests. */
 export function resetOutboundChannelBootstrapStateForTests(): void {
-  bootstrapAttempts.clear();
+  bootstrapRegistryGeneration = undefined;
+  bootstrapRegistriesByConfig.clear();
 }
 
 function channelEntryCanSend(entry: PluginChannelRegistration | undefined): boolean {
@@ -26,64 +65,72 @@ function channelEntryCanSend(entry: PluginChannelRegistration | undefined): bool
 
 function findChannelEntry(
   registry: ReturnType<typeof getActivePluginRegistry>,
-  channel: DeliverableMessageChannel,
+  channel: string,
 ): PluginChannelRegistration | undefined {
   return registry?.channels?.find((entry) => entry?.plugin?.id === channel);
 }
 
-function canResolveSendCapableChannel(channel: DeliverableMessageChannel): boolean {
-  const activeChannelRegistry = getActivePluginChannelRegistry();
-  const channelEntry = findChannelEntry(activeChannelRegistry, channel);
-  if (channelEntryCanSend(channelEntry)) {
-    return true;
-  }
-
-  const activeRegistry = getActivePluginRegistry();
-  if (activeRegistry && activeRegistry !== activeChannelRegistry) {
-    return channelEntryCanSend(findChannelEntry(activeRegistry, channel));
-  }
-  return false;
+function resolveSendCapableRegistry(
+  registry: PluginRegistry | null | undefined,
+  channel: string,
+): PluginRegistry | undefined {
+  return registry && channelEntryCanSend(findChannelEntry(registry, channel))
+    ? registry
+    : undefined;
 }
 
 /** Loads runtime plugins on demand when a selected outbound channel has only a setup shell. */
 export function bootstrapOutboundChannelPlugin(params: {
-  channel: DeliverableMessageChannel;
+  channel: string;
   cfg?: OpenClawConfig;
-}): void {
+}): PluginRegistry | undefined {
   const cfg = params.cfg;
   if (!cfg) {
-    return;
+    return undefined;
   }
 
-  if (canResolveSendCapableChannel(params.channel)) {
-    return;
+  const activeRegistry = getActivePluginRegistry();
+  const activeSendRegistry = resolveSendCapableRegistry(activeRegistry, params.channel);
+  if (activeSendRegistry) {
+    return activeSendRegistry;
   }
 
-  const attemptKey = `${getActivePluginChannelRegistryVersion()}:${getActivePluginRegistryVersion()}:${params.channel}`;
-  if (bootstrapAttempts.has(attemptKey)) {
-    return;
+  const registries = resolveBootstrapRegistries(cfg);
+  const cachedRegistry = registries.get(params.channel);
+  if (cachedRegistry !== undefined) {
+    cacheBootstrapOutcome(registries, params.channel, cachedRegistry);
+    return resolveSendCapableRegistry(cachedRegistry, params.channel);
   }
-  // Retry once per registry version/channel; failed loads clear the guard below
-  // so config fixes in the same process can try again.
-  bootstrapAttempts.add(attemptKey);
 
   const autoEnabled = applyPluginAutoEnable({ config: cfg });
   const defaultAgentId = resolveDefaultAgentId(autoEnabled.config);
   const workspaceDir = resolveAgentWorkspaceDir(autoEnabled.config, defaultAgentId);
+  const pluginIds = resolveDiscoverableScopedChannelPluginIds({
+    config: autoEnabled.config,
+    activationSourceConfig: cfg,
+    channelIds: [params.channel],
+    workspaceDir,
+    env: process.env,
+  });
+  const activatedConfig =
+    withActivatedPluginIds({ config: autoEnabled.config, pluginIds }) ?? autoEnabled.config;
+  const activatedSourceConfig = withActivatedPluginIds({ config: cfg, pluginIds }) ?? cfg;
+  let sendRegistry: PluginRegistry | undefined;
   try {
-    resolveRuntimePluginRegistry({
-      config: autoEnabled.config,
-      activationSourceConfig: cfg,
+    const registry = loadPluginRegistryHandle({
+      config: activatedConfig,
+      activationSourceConfig: activatedSourceConfig,
       autoEnabledReasons: autoEnabled.autoEnabledReasons,
+      onlyPluginIds: pluginIds,
       workspaceDir,
       runtimeOptions: {
         allowGatewaySubagentBinding: true,
       },
     });
-    if (!canResolveSendCapableChannel(params.channel)) {
-      bootstrapAttempts.delete(attemptKey);
-    }
+    sendRegistry = resolveSendCapableRegistry(registry, params.channel);
   } catch {
-    bootstrapAttempts.delete(attemptKey);
+    // Best-effort bootstrap; the caller reports the unavailable channel.
   }
+  cacheBootstrapOutcome(registries, params.channel, sendRegistry ?? null);
+  return sendRegistry;
 }

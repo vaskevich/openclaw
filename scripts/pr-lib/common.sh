@@ -6,6 +6,22 @@ require_artifact() {
   fi
 }
 
+validate_pr_temp_storage() {
+  local temp_dir="${TMPDIR:-/tmp}"
+  local probe=""
+  if ! probe=$(mktemp "${temp_dir%/}/openclaw-pr.XXXXXX"); then
+    :
+  elif ! printf 'openclaw-pr-temp-probe\n' >"$probe"; then
+    rm -f "$probe" 2>/dev/null || true
+  elif rm -f "$probe"; then
+    return 0
+  fi
+
+  echo "scripts/pr temporary-storage preflight failed under TMPDIR=$temp_dir." >&2
+  echo "Free disk space or set TMPDIR to a writable filesystem, then retry." >&2
+  return 1
+}
+
 path_is_docsish() {
   local path="$1"
   case "$path" in
@@ -20,13 +36,19 @@ file_list_is_docsish_only() {
   local files="$1"
   local saw_any=false
   local path
-  while IFS= read -r path; do
+  while [ -n "$files" ]; do
+    path="${files%%$'\n'*}"
+    if [ "$path" = "$files" ]; then
+      files=""
+    else
+      files="${files#*$'\n'}"
+    fi
     [ -n "$path" ] || continue
     saw_any=true
     if ! path_is_docsish "$path"; then
       return 1
     fi
-  done <<<"$files"
+  done
 
   [ "$saw_any" = "true" ]
 }
@@ -34,6 +56,15 @@ file_list_is_docsish_only() {
 changelog_required_for_changed_files() {
   # CHANGELOG.md is release-owned. Normal PRs carry release-note context in
   # PR bodies and commit messages; release automation generates the file.
+  return 1
+}
+
+root_changelog_update_allowed_for_pr() {
+  case "${OPENCLAW_ALLOW_ROOT_CHANGELOG_PR:-}" in
+    1|true|TRUE|yes|YES|on|ON)
+      return 0
+      ;;
+  esac
   return 1
 }
 
@@ -176,38 +207,33 @@ common_repo_root() {
 worktree_path_for_branch() {
   local branch="$1"
   local ref="refs/heads/$branch"
-
-  git worktree list --porcelain | awk -v ref="$ref" '
-    /^worktree / {
-      worktree=$2
-      next
-    }
-    /^branch / {
-      if ($2 == ref) {
-        print worktree
-        found=1
-      }
-    }
-    END {
-      if (!found) {
-        exit 1
-      }
-    }
-  '
+  local field worktree="" match=""
+  # Drain foreground Git before the supervisor checks for leftover children.
+  git worktree list --porcelain -z | {
+    while IFS= read -r -d '' field; do
+      case "$field" in
+        worktree\ *) worktree="${field#worktree }" ;;
+        "branch $ref") match="$worktree" ;;
+        "") worktree="" ;;
+      esac
+    done
+    [ -n "$match" ] || return 1
+    printf '%s\n' "$match"
+  }
 }
 
 worktree_is_registered() {
   local path="$1"
-  git worktree list --porcelain | awk -v target="$path" '
-    /^worktree / {
-      if ($2 == target) {
-        found=1
-      }
-    }
-    END {
-      exit found ? 0 : 1
-    }
-  '
+  local field found=false
+  # Git must finish before a successful operation can release its lock.
+  git worktree list --porcelain -z | {
+    while IFS= read -r -d '' field; do
+      case "$field" in
+        worktree\ *) [ "${field#worktree }" != "$path" ] || found=true ;;
+      esac
+    done
+    [ "$found" = true ]
+  }
 }
 
 resolve_existing_dir_path() {
@@ -250,24 +276,55 @@ is_repo_pr_worktree_dir() {
 
 remove_worktree_if_present() {
   local path="$1"
+  local registered_path=""
+  local registered_parent=""
+  registered_parent=$(resolve_existing_dir_path "$(dirname "$path")" 2>/dev/null || true)
+  if [ -n "$registered_parent" ]; then
+    registered_path="$registered_parent/$(basename "$path")"
+  fi
+
   if [ ! -e "$path" ]; then
+    # A torn-down PR worktree once left a stale registration that poisoned
+    # every later worktree add until the registration was pruned.
+    if [ -n "$registered_path" ] && worktree_is_registered "$registered_path"; then
+      git worktree prune || true
+      if worktree_is_registered "$registered_path"; then
+        echo "Warning: failed to remove registered worktree $path"
+      fi
+    fi
     return 0
   fi
 
-  if worktree_is_registered "$path"; then
-    git worktree remove "$path" --force >/dev/null 2>&1 || true
-  fi
-
-  if [ ! -e "$path" ]; then
+  if [ -L "$path" ] || ! is_repo_pr_worktree_dir "$path"; then
+    echo "Warning: refusing to remove non-canonical PR-worktree path $path"
     return 0
   fi
 
-  if worktree_is_registered "$path"; then
+  if [ -n "$registered_path" ] && worktree_is_registered "$registered_path"; then
+    local remove_error
+    if ! remove_error=$(git worktree remove --force "$registered_path" 2>&1); then
+      echo "Warning: git worktree remove failed for $path: $remove_error"
+    fi
+  fi
+
+  if [ ! -e "$path" ]; then
+    # See the stale-registration recovery above: removal can delete the path
+    # while leaving Git's linked-worktree metadata behind.
+    if [ -n "$registered_path" ] && worktree_is_registered "$registered_path"; then
+      git worktree prune || true
+      if worktree_is_registered "$registered_path"; then
+        echo "Warning: failed to remove registered worktree $path"
+      fi
+    fi
+    return 0
+  fi
+
+  if [ -n "$registered_path" ] && worktree_is_registered "$registered_path"; then
     echo "Warning: failed to remove registered worktree $path"
     return 0
   fi
 
-  if ! is_repo_pr_worktree_dir "$path"; then
+  if [ -L "$path" ] || ! is_repo_pr_worktree_dir "$path"; then
     echo "Warning: refusing to trash non-PR-worktree path $path"
     return 0
   fi

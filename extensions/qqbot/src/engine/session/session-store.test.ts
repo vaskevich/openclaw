@@ -1,21 +1,19 @@
 // Qqbot tests cover session store plugin behavior.
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
+import {
+  resolvePreferredOpenClawTmpDir,
+  tempWorkspaceSync,
+  type TempWorkspaceSync,
+} from "openclaw/plugin-sdk/temp-path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   installQQBotRuntimeForStateTests,
   resetQQBotStateTestRuntime,
 } from "../../test-support/runtime.js";
-import type { SessionState } from "./session-store.js";
+type SessionState = Parameters<(typeof import("./session-store.js"))["saveSession"]>[0];
 
-const createdDirs: string[] = [];
-
-function createTempDir(prefix: string): string {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
-  createdDirs.push(dir);
-  return dir;
-}
+const tempWorkspaces: TempWorkspaceSync[] = [];
 
 async function useMockHome(homeDir: string): Promise<void> {
   vi.doMock("node:os", async (importOriginal) => {
@@ -29,8 +27,17 @@ async function useMockHome(homeDir: string): Promise<void> {
 }
 
 async function useStateAndHome(): Promise<{ stateDir: string; homeDir: string }> {
-  const stateDir = createTempDir("qqbot-state-");
-  const homeDir = createTempDir("qqbot-home-");
+  const stateWorkspace = tempWorkspaceSync({
+    rootDir: resolvePreferredOpenClawTmpDir(),
+    prefix: "qqbot-state-",
+  });
+  const homeWorkspace = tempWorkspaceSync({
+    rootDir: resolvePreferredOpenClawTmpDir(),
+    prefix: "qqbot-home-",
+  });
+  tempWorkspaces.push(stateWorkspace, homeWorkspace);
+  const stateDir = stateWorkspace.dir;
+  const homeDir = homeWorkspace.dir;
   vi.stubEnv("OPENCLAW_STATE_DIR", stateDir);
   vi.stubEnv("HOME", homeDir);
   await useMockHome(homeDir);
@@ -76,8 +83,8 @@ describe("engine/session/session-store", () => {
     vi.doUnmock("node:os");
     vi.resetModules();
     vi.unstubAllEnvs();
-    for (const dir of createdDirs.splice(0)) {
-      fs.rmSync(dir, { recursive: true, force: true });
+    for (const workspace of tempWorkspaces.splice(0)) {
+      workspace.cleanup();
     }
   });
 
@@ -91,14 +98,13 @@ describe("engine/session/session-store", () => {
     expect(fs.existsSync(sessionPath(homeDir, "acct-1"))).toBe(false);
   });
 
-  it("imports legacy JSON sessions and removes the old file", async () => {
+  it("does not import legacy JSON session cache files", async () => {
     const { loadSession } = await import("./session-store.js");
     const homeDir = process.env.HOME!;
     const legacyPath = writeLegacySession(homeDir, makeSession({ sessionId: "legacy-session" }));
 
-    expect(loadSession("acct-1", "app-1")?.sessionId).toBe("legacy-session");
-    expect(fs.existsSync(legacyPath)).toBe(false);
-    expect(loadSession("acct-1", "app-1")?.sessionId).toBe("legacy-session");
+    expect(loadSession("acct-1", "app-1")).toBeNull();
+    expect(fs.existsSync(legacyPath)).toBe(true);
   });
 
   it("deletes mismatched appId sessions from SQLite", async () => {
@@ -107,17 +113,5 @@ describe("engine/session/session-store", () => {
 
     expect(loadSession("acct-1", "app-b")).toBeNull();
     expect(loadSession("acct-1", "app-a")).toBeNull();
-  });
-
-  it("drops expired legacy JSON sessions during import", async () => {
-    const { loadSession } = await import("./session-store.js");
-    const homeDir = process.env.HOME!;
-    const legacyPath = writeLegacySession(
-      homeDir,
-      makeSession({ savedAt: Date.now() - 10 * 60 * 1000 }),
-    );
-
-    expect(loadSession("acct-1", "app-1")).toBeNull();
-    expect(fs.existsSync(legacyPath)).toBe(false);
   });
 });

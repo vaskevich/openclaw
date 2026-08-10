@@ -3,16 +3,20 @@ import {
   embeddedAgentLog,
   type EmbeddedRunAttemptParams,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
+import { sliceUtf16Safe } from "openclaw/plugin-sdk/text-utility-runtime";
 import { formatCodexDisplayText } from "../command-formatters.js";
 import {
   approvalRequestExplicitlyUnavailable,
   mapExecDecisionToOutcome,
   requestPluginApproval,
+  sanitizeCodexApprovalVisibleText,
+  truncateCodexApprovalDisplayText as truncateDisplayText,
   type AppServerApprovalOutcome,
   type ExecApprovalDecision,
   waitForPluginApprovalDecision,
 } from "./plugin-approval-roundtrip.js";
 import type {
+  CodexAppPolicyContextEntry,
   PluginAppPolicyContext,
   PluginAppPolicyContextEntry,
 } from "./plugin-thread-config.js";
@@ -35,7 +39,7 @@ type BridgeableApprovalElicitation = {
 
 type PluginElicitationResolution =
   | { kind: "not_plugin" }
-  | { kind: "matched"; entry: PluginAppPolicyContextEntry }
+  | { kind: "matched"; entry: CodexAppPolicyContextEntry }
   | { kind: "decline"; reason: string };
 
 const MCP_TOOL_APPROVAL_KIND = "mcp_tool_call";
@@ -65,22 +69,6 @@ const MAX_DISPLAY_VALUE_ARRAY_ITEMS = 8;
 const MAX_DISPLAY_VALUE_OBJECT_KEYS = 8;
 const MAX_DISPLAY_VALUE_DEPTH = 3;
 const DISPLAY_TEXT_SCAN_MAX_LENGTH = 4096;
-const ANSI_OSC_SEQUENCE_RE = new RegExp(
-  String.raw`(?:\u001b]|\u009d)[^\u001b\u009c\u0007]*(?:\u0007|\u001b\\|\u009c)`,
-  "g",
-);
-const ANSI_CONTROL_SEQUENCE_RE = new RegExp(
-  String.raw`(?:\u001b\[[0-?]*[ -/]*[@-~]|\u009b[0-?]*[ -/]*[@-~]|\u001b[@-Z\\-_])`,
-  "g",
-);
-const CONTROL_CHARACTER_RE = new RegExp(String.raw`[\u0000-\u001f\u007f-\u009f]+`, "g");
-const INVISIBLE_FORMATTING_CONTROL_RE = new RegExp(
-  String.raw`[\u00ad\u034f\u061c\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff\ufe00-\ufe0f\u{e0100}-\u{e01ef}]`,
-  "gu",
-);
-const DANGLING_TERMINAL_SEQUENCE_SUFFIX_RE = new RegExp(
-  String.raw`(?:\u001b\][^\u001b\u009c\u0007]*|\u009d[^\u001b\u009c\u0007]*|\u001b\[[0-?]*[ -/]*|\u009b[0-?]*[ -/]*|\u001b)$`,
-);
 
 export async function handleCodexAppServerElicitationRequest(params: {
   requestParams: JsonValue | undefined;
@@ -92,13 +80,11 @@ export async function handleCodexAppServerElicitationRequest(params: {
   signal?: AbortSignal;
 }): Promise<JsonValue | undefined> {
   const requestParams = isJsonObject(params.requestParams) ? params.requestParams : undefined;
-  if (!requestParams) {
+  if (!requestParams || readString(requestParams, "threadId") !== params.threadId) {
     return undefined;
   }
-  if (!matchesCurrentThread(requestParams, params.threadId)) {
-    return undefined;
-  }
-  if (turnIdMismatches(requestParams, params.turnId)) {
+  const requestTurnId = requestParams.turnId;
+  if (requestTurnId !== null && requestTurnId !== undefined && requestTurnId !== params.turnId) {
     return undefined;
   }
   const pluginResolution = resolvePluginElicitation({
@@ -110,7 +96,7 @@ export async function handleCodexAppServerElicitationRequest(params: {
       logPluginElicitationDecline(pluginResolution.reason, requestParams);
       return declineElicitationResponse();
     }
-    if (!hasExactTurnId(requestParams, params.turnId)) {
+    if (requestTurnId !== params.turnId) {
       logPluginElicitationDecline("missing_active_turn", requestParams);
       return declineElicitationResponse();
     }
@@ -139,34 +125,15 @@ export async function handleCodexAppServerElicitationRequest(params: {
   return buildElicitationResponse(approvalPrompt, outcome);
 }
 
-function matchesCurrentThread(requestParams: JsonObject | undefined, threadId: string): boolean {
-  if (!requestParams) {
-    return false;
-  }
-  const requestThreadId = readString(requestParams, "threadId");
-  return requestThreadId === threadId;
-}
-
-function turnIdMismatches(requestParams: JsonObject | undefined, turnId: string): boolean {
-  const rawTurnId = requestParams?.turnId;
-  return rawTurnId !== null && rawTurnId !== undefined && rawTurnId !== turnId;
-}
-
-function hasExactTurnId(requestParams: JsonObject | undefined, turnId: string): boolean {
-  return requestParams?.turnId === turnId;
-}
-
 function resolvePluginElicitation(params: {
-  requestParams: JsonObject | undefined;
+  requestParams: JsonObject;
   pluginAppPolicyContext?: PluginAppPolicyContext;
 }): PluginElicitationResolution {
   const requestParams = params.requestParams;
-  if (!requestParams) {
-    return { kind: "not_plugin" };
-  }
   const meta = isJsonObject(requestParams["_meta"]) ? requestParams["_meta"] : {};
   const context = params.pluginAppPolicyContext;
   const entries = context ? Object.values(context.apps) : [];
+  const pluginEntries = entries.filter(isPluginAppPolicyContextEntry);
 
   const appId =
     readFirstString(meta, PLUGIN_APP_ID_META_KEYS) ??
@@ -181,6 +148,9 @@ function resolvePluginElicitation(params: {
       return { kind: "decline", reason: "missing_policy_context" };
     }
     const entry = context.apps[appId];
+    if (entry?.source === "account" && !isCodexConnectorApproval) {
+      return { kind: "decline", reason: "account_app_source_mismatch" };
+    }
     return uniquePluginMatch(entry ? [entry] : [], "app_id");
   }
   if (isCodexConnectorApproval && connectorId) {
@@ -202,7 +172,7 @@ function resolvePluginElicitation(params: {
   const metadataResolution = resolvePluginStableMetadataMatch({
     meta,
     requestParams,
-    entries,
+    entries: pluginEntries,
     context,
   });
   if (metadataResolution.kind !== "not_plugin") {
@@ -261,7 +231,7 @@ function resolvePluginStableMetadataMatch(params: {
 }
 
 function uniquePluginMatch(
-  matches: PluginAppPolicyContextEntry[],
+  matches: CodexAppPolicyContextEntry[],
   source: string,
 ): PluginElicitationResolution {
   if (matches.length === 1 && matches[0]) {
@@ -275,7 +245,7 @@ function uniquePluginMatch(
 
 function hasDisplayNameOnlyPluginMatch(
   meta: JsonObject,
-  entries: PluginAppPolicyContextEntry[],
+  entries: CodexAppPolicyContextEntry[],
 ): boolean {
   const connectorName = readString(meta, MCP_TOOL_APPROVAL_CONNECTOR_NAME_KEY);
   if (!connectorName) {
@@ -284,9 +254,20 @@ function hasDisplayNameOnlyPluginMatch(
   const normalized = normalizePluginIdentityText(connectorName);
   return entries.some(
     (entry) =>
-      normalizePluginIdentityText(entry.pluginName) === normalized ||
-      normalizePluginIdentityText(entry.configKey) === normalized,
+      normalizePluginIdentityText(appPolicyDisplayName(entry)) === normalized ||
+      (isPluginAppPolicyContextEntry(entry) &&
+        normalizePluginIdentityText(entry.configKey) === normalized),
   );
+}
+
+function isPluginAppPolicyContextEntry(
+  entry: CodexAppPolicyContextEntry,
+): entry is PluginAppPolicyContextEntry {
+  return entry.source !== "account";
+}
+
+function appPolicyDisplayName(entry: CodexAppPolicyContextEntry): string {
+  return isPluginAppPolicyContextEntry(entry) ? entry.pluginName : entry.appName;
 }
 
 function normalizePluginIdentityText(value: string): string {
@@ -294,7 +275,7 @@ function normalizePluginIdentityText(value: string): string {
 }
 
 async function buildPluginPolicyElicitationResponse(params: {
-  entry: PluginAppPolicyContextEntry;
+  entry: CodexAppPolicyContextEntry;
   requestParams: JsonObject;
   paramsForRun: EmbeddedRunAttemptParams;
   signal?: AbortSignal;
@@ -331,31 +312,31 @@ async function buildPluginPolicyElicitationResponse(params: {
 }
 
 function resolvePluginDestructiveApprovalMode(
-  entry: PluginAppPolicyContextEntry,
-): "allow" | "deny" | "auto" | "always" {
+  entry: CodexAppPolicyContextEntry,
+): "allow" | "deny" | "auto" | "ask" {
   return entry.destructiveApprovalMode ?? (entry.allowDestructiveActions ? "allow" : "deny");
 }
 
 function allowedPluginPolicyApprovalDecisions(
-  mode: "allow" | "deny" | "auto" | "always",
+  mode: "allow" | "deny" | "auto" | "ask",
   approvalPrompt: BridgeableApprovalElicitation,
 ): ExecApprovalDecision[] {
   const allowedDecisions = approvalPrompt.allowedDecisions ?? ["allow-once", "deny"];
-  if (mode !== "always") {
+  if (mode !== "ask") {
     return allowedDecisions;
   }
   return allowedDecisions.filter((decision) => decision !== "allow-always");
 }
 
 function oneShotPluginPolicyApprovalOutcome(
-  mode: "allow" | "deny" | "auto" | "always",
+  mode: "allow" | "deny" | "auto" | "ask",
   outcome: AppServerApprovalOutcome,
 ): AppServerApprovalOutcome {
-  return mode === "always" && outcome === "approved-session" ? "approved-once" : outcome;
+  return mode === "ask" && outcome === "approved-session" ? "approved-once" : outcome;
 }
 
 function readPluginApprovalElicitation(
-  entry: PluginAppPolicyContextEntry,
+  entry: CodexAppPolicyContextEntry,
   requestParams: JsonObject,
 ): BridgeableApprovalElicitation | undefined {
   if (
@@ -377,7 +358,7 @@ function readPluginApprovalElicitation(
     sanitizeDisplayText(readString(requestParams, "message") ?? "") || "Codex plugin approval";
   const descriptionMeta: JsonObject = { ...meta };
   if (!readString(descriptionMeta, MCP_TOOL_APPROVAL_CONNECTOR_NAME_KEY)) {
-    descriptionMeta[MCP_TOOL_APPROVAL_CONNECTOR_NAME_KEY] = entry.pluginName;
+    descriptionMeta[MCP_TOOL_APPROVAL_CONNECTOR_NAME_KEY] = appPolicyDisplayName(entry);
   }
   return {
     title,
@@ -649,22 +630,13 @@ function sanitizeOptionalDisplayText(value: string | undefined): string | undefi
 }
 
 function sanitizeDisplayText(value: string): string {
-  const scanned = value.slice(0, DISPLAY_TEXT_SCAN_MAX_LENGTH);
+  const scanned = sliceUtf16Safe(value, 0, DISPLAY_TEXT_SCAN_MAX_LENGTH);
   const clipped = value.length > DISPLAY_TEXT_SCAN_MAX_LENGTH;
-  const sanitized = scanned
-    .replace(ANSI_OSC_SEQUENCE_RE, "")
-    .replace(ANSI_CONTROL_SEQUENCE_RE, "")
-    .replace(DANGLING_TERMINAL_SEQUENCE_SUFFIX_RE, "")
-    .replace(INVISIBLE_FORMATTING_CONTROL_RE, " ")
-    .replace(CONTROL_CHARACTER_RE, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+  const sanitized = sanitizeCodexApprovalVisibleText(scanned, {
+    stripDanglingTerminalSequence: true,
+  });
   const escaped = sanitized ? formatCodexDisplayText(sanitized) : "";
   return clipped && escaped ? `${escaped}...` : escaped;
-}
-
-function truncateDisplayText(value: string, maxLength: number): string {
-  return value.length <= maxLength ? value : `${value.slice(0, Math.max(0, maxLength - 3))}...`;
 }
 
 async function requestPluginApprovalOutcome(params: {
@@ -714,24 +686,17 @@ function buildElicitationResponse(
   }
 
   const content = buildAcceptedContent(approvalPrompt, outcome);
-  if (!content) {
-    if (hasNoSchemaProperties(requestedSchema)) {
-      return {
-        action: "accept",
-        content: null,
-        _meta: buildAcceptedMeta(meta, outcome, approvalPrompt.persistHintsMode ?? "legacy"),
-      };
-    }
+  if (!content && !hasNoSchemaProperties(requestedSchema)) {
     embeddedAgentLog.warn("codex MCP approval elicitation approved without a mappable response", {
       approvalKind: meta[MCP_TOOL_APPROVAL_KIND_KEY],
       fields: Object.keys(requestedSchema.properties ?? {}),
       outcome,
     });
-    return { action: "decline", content: null, _meta: null };
+    return declineElicitationResponse();
   }
   return {
     action: "accept",
-    content,
+    content: content ?? null,
     _meta: buildAcceptedMeta(meta, outcome, approvalPrompt.persistHintsMode ?? "legacy"),
   };
 }
@@ -839,10 +804,6 @@ function readPersistFieldValue(
   return undefined;
 }
 
-function readDefaultValue(schema: JsonObject): JsonValue | undefined {
-  return schema.default as JsonValue | undefined;
-}
-
 function readFallbackFieldValue(
   property: ApprovalPropertyContext,
   outcome: AppServerApprovalOutcome,
@@ -850,7 +811,7 @@ function readFallbackFieldValue(
   if (outcome === "approved-once" && isPersistField(property)) {
     return undefined;
   }
-  return readDefaultValue(property.schema);
+  return property.schema.default as JsonValue | undefined;
 }
 
 function isApprovalField(property: ApprovalPropertyContext): boolean {
@@ -974,3 +935,4 @@ function readFirstString(record: JsonObject | undefined, keys: string[]): string
   }
   return undefined;
 }
+/* oxlint-disable max-lines -- TODO: split this grandfathered oversized file. */

@@ -3,7 +3,7 @@ import { execFileSync } from "node:child_process";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { collectPackagePatchViolations } from "../../scripts/check-package-patches.mjs";
+import { collectPackagePatchViolations } from "../../scripts/check-package-patches.mts";
 import { cleanupTempDirs, makeTempRepoRoot, writeJsonFile } from "../helpers/temp-repo.js";
 
 const tempDirs: string[] = [];
@@ -18,7 +18,7 @@ const nestedGitEnvKeys = [
 ] as const;
 
 function createNestedGitEnv(): NodeJS.ProcessEnv {
-  const env = {
+  const env: NodeJS.ProcessEnv = {
     ...process.env,
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_TERMINAL_PROMPT: "0",
@@ -52,7 +52,7 @@ afterEach(() => {
 });
 
 describe("check-package-patches", () => {
-  it("allows the existing legacy pnpm patches", () => {
+  it("allows approved pnpm patches", () => {
     const dir = makeRepo();
     mkdirSync(path.join(dir, "patches"), { recursive: true });
     writeFileSync(
@@ -61,8 +61,6 @@ describe("check-package-patches", () => {
   - .
 patchedDependencies:
   "baileys@7.0.0-rc12": "patches/baileys@7.0.0-rc12.patch"
-  "@agentclientprotocol/claude-agent-acp@0.37.0": "patches/@agentclientprotocol__claude-agent-acp@0.37.0.patch"
-  "@agentclientprotocol/claude-agent-acp@0.39.0": "patches/@agentclientprotocol__claude-agent-acp@0.39.0.patch"
 `,
       "utf8",
     );
@@ -70,23 +68,11 @@ patchedDependencies:
       path.join(dir, "pnpm-lock.yaml"),
       `lockfileVersion: '9.0'
 patchedDependencies:
-  '@agentclientprotocol/claude-agent-acp@0.37.0': 3c1bd768608166e6b2799e51a56ede1fdda010fd60ab52a64f7d309dc6192b35
-  '@agentclientprotocol/claude-agent-acp@0.39.0': aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
   baileys@7.0.0-rc12: a9aea1790d2c65b1ae543c77faca4119bbfb91ee3b6ca6c38d1cad4f5702ada2
 `,
       "utf8",
     );
     writeFileSync(path.join(dir, "patches", "baileys@7.0.0-rc12.patch"), "diff\n", "utf8");
-    writeFileSync(
-      path.join(dir, "patches", "@agentclientprotocol__claude-agent-acp@0.37.0.patch"),
-      "diff\n",
-      "utf8",
-    );
-    writeFileSync(
-      path.join(dir, "patches", "@agentclientprotocol__claude-agent-acp@0.39.0.patch"),
-      "diff\n",
-      "utf8",
-    );
     git(dir, ["add", "pnpm-workspace.yaml", "pnpm-lock.yaml", "patches"]);
 
     expect(collectPackagePatchViolations(dir)).toEqual([]);

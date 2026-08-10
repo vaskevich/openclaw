@@ -1,7 +1,6 @@
 // Runtime boundary for resolving provider plugins from metadata and config.
 import { sortUniqueStrings } from "@openclaw/normalization-core/string-normalization";
-import { withActivatedPluginIds } from "./activation-context.js";
-import { resolveBundledPluginCompatibleActivationInputs } from "./activation-context.js";
+import { resolvePluginActivationInputs, withActivatedPluginIds } from "./activation-context.js";
 import { resolveManifestActivationPluginIds } from "./activation-planner.js";
 import { getLoadedRuntimePluginRegistry } from "./active-runtime-registry.js";
 import { extractPluginInstallRecordsFromInstalledPluginIndex } from "./installed-plugin-index-install-records.js";
@@ -20,10 +19,8 @@ import {
   resolveDiscoverableProviderOwnerPluginIds,
   resolveDiscoveredProviderPluginIds,
   resolveEnabledProviderPluginIds,
-  resolveBundledProviderCompatPluginIds,
   resolveOwningPluginIdsForModelRefs,
   resolveOwningPluginIdsForProviderRef,
-  withBundledProviderVitestCompat,
 } from "./providers.js";
 import { getActivePluginRegistryWorkspaceDir } from "./runtime.js";
 import {
@@ -31,10 +28,6 @@ import {
   createPluginRuntimeLoaderLogger,
 } from "./runtime/load-context.js";
 import type { ProviderPlugin } from "./types.js";
-
-function dedupeSortedPluginIds(values: Iterable<string>): string[] {
-  return sortUniqueStrings(values);
-}
 
 function resolveExplicitProviderOwnerPluginIds(
   params: {
@@ -45,7 +38,7 @@ function resolveExplicitProviderOwnerPluginIds(
   },
   snapshot: PluginMetadataRegistryView,
 ): string[] {
-  return dedupeSortedPluginIds(
+  return sortUniqueStrings(
     params.providerRefs.flatMap((provider) => {
       const plannedPluginIds = resolveManifestActivationPluginIds({
         trigger: {
@@ -99,7 +92,7 @@ function mergeExplicitOwnerPluginIds(
   if (explicitOwnerPluginIds.length === 0) {
     return [...providerPluginIds];
   }
-  return dedupeSortedPluginIds([...providerPluginIds, ...explicitOwnerPluginIds]);
+  return sortUniqueStrings([...providerPluginIds, ...explicitOwnerPluginIds]);
 }
 
 function resolvePluginProviderLoadBase(
@@ -141,13 +134,13 @@ function resolvePluginProviderLoadBase(
     params.modelRefs?.length ||
     providerOwnedPluginIds.length > 0 ||
     modelOwnedPluginIds.length > 0
-      ? dedupeSortedPluginIds([
+      ? sortUniqueStrings([
           ...(params.onlyPluginIds ?? []),
           ...providerOwnedPluginIds,
           ...modelOwnedPluginIds,
         ])
       : undefined;
-  const explicitOwnerPluginIds = dedupeSortedPluginIds([
+  const explicitOwnerPluginIds = sortUniqueStrings([
     ...providerOwnedPluginIds,
     ...modelOwnedPluginIds,
   ]);
@@ -246,37 +239,23 @@ function resolveRuntimeProviderPluginLoadState(
   });
   const runtimeRequestedPluginIds =
     base.requestedPluginIds !== undefined
-      ? dedupeSortedPluginIds([...(params.onlyPluginIds ?? []), ...explicitOwnerPluginIds])
+      ? sortUniqueStrings([...(params.onlyPluginIds ?? []), ...explicitOwnerPluginIds])
       : undefined;
   const requestConfig = withActivatedPluginIds({
     config: base.rawConfig,
     pluginIds: explicitOwnerPluginIds,
   });
-  const activation = resolveBundledPluginCompatibleActivationInputs({
+  const activation = resolvePluginActivationInputs({
     rawConfig: requestConfig,
     env: base.env,
     workspaceDir: base.workspaceDir,
-    onlyPluginIds: runtimeRequestedPluginIds,
     applyAutoEnable: params.applyAutoEnable ?? true,
-    compatMode: {
-      vitest: params.bundledProviderVitestCompat,
-    },
-    resolveCompatPluginIds: (compatParams) =>
-      resolveBundledProviderCompatPluginIds({
-        ...compatParams,
-        manifestRegistry: snapshot.manifestRegistry,
-      }),
+    discovery: snapshot.discovery,
+    manifestRegistry: snapshot.manifestRegistry,
   });
-  const config = params.bundledProviderVitestCompat
-    ? withBundledProviderVitestCompat({
-        config: activation.config,
-        pluginIds: activation.compatPluginIds,
-        env: base.env,
-      })
-    : activation.config;
   const providerPluginIds = mergeExplicitOwnerPluginIds(
     resolveEnabledProviderPluginIds({
-      config,
+      config: activation.config,
       workspaceDir: base.workspaceDir,
       env: base.env,
       onlyPluginIds: runtimeRequestedPluginIds,
@@ -287,7 +266,7 @@ function resolveRuntimeProviderPluginLoadState(
   );
   const loadOptions = buildPluginRuntimeLoadOptionsFromValues(
     {
-      config,
+      config: activation.config,
       activationSourceConfig: activation.activationSourceConfig,
       autoEnabledReasons: activation.autoEnabledReasons,
       workspaceDir: base.workspaceDir,
@@ -326,6 +305,7 @@ export function resolvePluginProviders(params: {
   workspaceDir?: string;
   /** Use an explicit env when plugin roots should resolve independently from process.env. */
   env?: PluginLoadOptions["env"];
+  /** @deprecated Ignored; tests must provide explicit plugin config. Remove in the next major release. */
   bundledProviderVitestCompat?: boolean;
   onlyPluginIds?: string[];
   providerRefs?: readonly string[];

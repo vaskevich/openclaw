@@ -1,18 +1,34 @@
 // Plugin Lifecycle Probe tests cover QA Lab plugin lifecycle evidence.
 import { spawn, spawnSync } from "node:child_process";
+/* oxlint-disable eslint/no-shadow, eslint/prefer-const, eslint/no-promise-executor-return, typescript/restrict-template-expressions, typescript/no-base-to-string -- QA probe intentionally validates loosely typed external JSON and mirrors child-process callback shapes. */
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { readPluginInstallRecords } from "../../../../scripts/e2e/lib/plugin-index-sqlite.mjs";
 import { resolveWindowsTaskkillPath } from "../../../../scripts/lib/windows-taskkill.mjs";
-import { createTempDirTracker } from "../../../helpers/temp-dir.js";
 
-const tempDirs = createTempDirTracker();
+// The Docker entrypoint runs without Vitest installed, so keep cleanup local to this runtime probe.
+const tempDirs = (() => {
+  const dirs = new Set<string>();
+  return {
+    make(prefix: string): string {
+      const dir = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+      dirs.add(dir);
+      return dir;
+    },
+    cleanup(): void {
+      for (const dir of dirs) {
+        fs.rmSync(dir, { recursive: true, force: true, maxRetries: 5, retryDelay: 20 });
+      }
+      dirs.clear();
+    },
+  };
+})();
 
-type ProbeEnv = Pick<NodeJS.ProcessEnv, "HOME" | "OPENCLAW_CONFIG_PATH" | "OPENCLAW_STATE_DIR">;
+type ProbeEnv = NodeJS.ProcessEnv;
 
-type MatrixEnv = NodeJS.ProcessEnv & ProbeEnv;
+type MatrixEnv = NodeJS.ProcessEnv;
 
 interface CommandOptions {
   env?: NodeJS.ProcessEnv;
@@ -126,7 +142,11 @@ function assertNpmProjectRoot(pluginId: string, packageName: string, env: ProbeE
   );
 }
 
-export function assertInspectLoaded(pluginId: string, inspectPath: string | undefined) {
+function assertInspectState(
+  pluginId: string,
+  inspectPath: string | undefined,
+  expected: { enabled: boolean; status: "disabled" | "loaded" },
+) {
   assertProbe(inspectPath, "inspect JSON path is required");
   const inspect = readRequiredJson(inspectPath);
   const plugin = inspect.plugin as
@@ -137,11 +157,22 @@ export function assertInspectLoaded(pluginId: string, inspectPath: string | unde
     plugin?.id === pluginId,
     `expected inspected plugin id ${pluginId}, got ${plugin?.id}`,
   );
-  assertProbe(plugin.enabled === true, `expected ${pluginId} inspect enabled=true`);
   assertProbe(
-    plugin.status === "loaded",
-    `expected ${pluginId} inspect status loaded, got ${plugin.status}`,
+    plugin.enabled === expected.enabled,
+    `expected ${pluginId} inspect enabled=${expected.enabled}`,
   );
+  assertProbe(
+    plugin.status === expected.status,
+    `expected ${pluginId} inspect status ${expected.status}, got ${plugin.status}`,
+  );
+}
+
+export function assertInspectLoaded(pluginId: string, inspectPath: string | undefined) {
+  assertInspectState(pluginId, inspectPath, { enabled: true, status: "loaded" });
+}
+
+export function assertInspectDisabled(pluginId: string, inspectPath: string | undefined) {
+  assertInspectState(pluginId, inspectPath, { enabled: false, status: "disabled" });
 }
 
 function assertEnabled(pluginId: string, expected: boolean, env: ProbeEnv = process.env) {
@@ -477,7 +508,31 @@ async function runMeasured(
   );
 }
 
-export async function runPluginLifecycleMatrix() {
+async function runRuntimeInspect(params: {
+  summaryTsv: string;
+  phase: string;
+  entry: string;
+  pluginId: string;
+  inspectPath: string;
+  env: MatrixEnv;
+}) {
+  await runMeasured(
+    params.summaryTsv,
+    params.phase,
+    "bash",
+    [
+      "-c",
+      'node "$1" plugins inspect "$2" --runtime --json >"$3"',
+      "bash",
+      params.entry,
+      params.pluginId,
+      params.inspectPath,
+    ],
+    params.env,
+  );
+}
+
+async function runPluginLifecycleMatrix() {
   const pluginId = "lifecycle-claw";
   const packageName = "@openclaw/lifecycle-claw";
   const resourceDir = tempDirs.make("openclaw-plugin-lifecycle-matrix-");
@@ -486,6 +541,10 @@ export async function runPluginLifecycleMatrix() {
   const tarballV1 = path.join(resourceDir, "lifecycle-claw-1.0.0.tgz");
   const tarballV2 = path.join(resourceDir, "lifecycle-claw-2.0.0.tgz");
   const inspectV1 = path.join(resourceDir, "plugin-lifecycle-inspect-v1.json");
+  const inspectDisabled = path.join(resourceDir, "plugin-lifecycle-inspect-disabled.json");
+  const inspectReenabled = path.join(resourceDir, "plugin-lifecycle-inspect-reenabled.json");
+  const inspectV2 = path.join(resourceDir, "plugin-lifecycle-inspect-v2.json");
+  const inspectDowngradeV1 = path.join(resourceDir, "plugin-lifecycle-inspect-downgrade-v1.json");
   const summaryTsv = path.join(resourceDir, "resource-summary.tsv");
   let registry: RegistryServer | undefined;
 
@@ -538,26 +597,20 @@ export async function runPluginLifecycleMatrix() {
       summaryTsv,
       "install-v1",
       "node",
-      [entry, "plugins", "install", `npm:${packageName}@1.0.0`],
+      [entry, "plugins", "install", `npm:${packageName}@1.0.0`, "--force"],
       runEnv,
     );
     assertVersion(pluginId, "1.0.0", runEnv);
     assertNpmProjectRoot(pluginId, packageName, runEnv);
 
-    await runMeasured(
+    await runRuntimeInspect({
       summaryTsv,
-      "inspect-v1",
-      "bash",
-      [
-        "-c",
-        'node "$1" plugins inspect "$2" --runtime --json >"$3"',
-        "bash",
-        entry,
-        pluginId,
-        inspectV1,
-      ],
-      runEnv,
-    );
+      phase: "inspect-v1",
+      entry,
+      pluginId,
+      inspectPath: inspectV1,
+      env: runEnv,
+    });
     assertInspectLoaded(pluginId, inspectV1);
 
     await runMeasured(
@@ -568,9 +621,27 @@ export async function runPluginLifecycleMatrix() {
       runEnv,
     );
     assertEnabled(pluginId, false, runEnv);
+    await runRuntimeInspect({
+      summaryTsv,
+      phase: "inspect-disabled",
+      entry,
+      pluginId,
+      inspectPath: inspectDisabled,
+      env: runEnv,
+    });
+    assertInspectDisabled(pluginId, inspectDisabled);
 
     await runMeasured(summaryTsv, "enable", "node", [entry, "plugins", "enable", pluginId], runEnv);
     assertEnabled(pluginId, true, runEnv);
+    await runRuntimeInspect({
+      summaryTsv,
+      phase: "inspect-reenabled",
+      entry,
+      pluginId,
+      inspectPath: inspectReenabled,
+      env: runEnv,
+    });
+    assertInspectLoaded(pluginId, inspectReenabled);
 
     await runMeasured(
       summaryTsv,
@@ -581,6 +652,15 @@ export async function runPluginLifecycleMatrix() {
     );
     assertVersion(pluginId, "2.0.0", runEnv);
     assertNpmProjectRoot(pluginId, packageName, runEnv);
+    await runRuntimeInspect({
+      summaryTsv,
+      phase: "inspect-v2",
+      entry,
+      pluginId,
+      inspectPath: inspectV2,
+      env: runEnv,
+    });
+    assertInspectLoaded(pluginId, inspectV2);
 
     await runMeasured(
       summaryTsv,
@@ -591,6 +671,15 @@ export async function runPluginLifecycleMatrix() {
     );
     assertVersion(pluginId, "1.0.0", runEnv);
     assertNpmProjectRoot(pluginId, packageName, runEnv);
+    await runRuntimeInspect({
+      summaryTsv,
+      phase: "inspect-downgrade-v1",
+      entry,
+      pluginId,
+      inspectPath: inspectDowngradeV1,
+      env: runEnv,
+    });
+    assertInspectLoaded(pluginId, inspectDowngradeV1);
 
     const installedPath = installPath(pluginId, runEnv);
     fs.rmSync(installedPath, { recursive: true, force: true });

@@ -1,21 +1,27 @@
 // Agent delivery planning resolves final reply destinations from explicit
 // options, session history, turn source, bindings, and channel route hooks.
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
-import type { ChannelOutboundTargetMode } from "../../channels/plugins/types.public.js";
-import type { ChannelId } from "../../channels/plugins/types.public.js";
+import { resolveChannelDefaultAccountId } from "../../channels/plugins/helpers.js";
+import type {
+  ChannelId,
+  ChannelOutboundTargetMode,
+  ChannelPlugin,
+} from "../../channels/plugins/types.public.js";
+import { listRouteBindings } from "../../config/bindings.js";
 import type { SessionEntry } from "../../config/sessions.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
-import { normalizeAccountId } from "../../utils/account-id.js";
+import { normalizeOptionalAccountId } from "../../routing/account-id.js";
+import { normalizeRouteBindingChannelId } from "../../routing/binding-scope.js";
+import { resolveAgentRoute } from "../../routing/resolve-route.js";
+import { buildAgentMainSessionKey, normalizeAgentId } from "../../routing/session-key.js";
 import {
   INTERNAL_MESSAGE_CHANNEL,
   isDeliverableMessageChannel,
   isGatewayMessageChannel,
   normalizeMessageChannel,
-  type GatewayMessageChannel,
 } from "../../utils/message-channel.js";
 import { resolveOutboundChannelPlugin } from "./channel-resolution.js";
-import { resolveOutboundSessionRoute } from "./outbound-session.js";
-import { isReservedTargetLiteralError } from "./target-errors.js";
+import { resolveOutboundSessionRoute, type OutboundSessionRoute } from "./outbound-session.js";
 import { resolveChannelTarget, type ResolvedMessagingTarget } from "./target-resolver.js";
 import type { OutboundTargetResolution } from "./targets.js";
 import {
@@ -24,17 +30,40 @@ import {
   type SessionDeliveryTarget,
 } from "./targets.js";
 
-export type AgentDeliveryPlan = {
+type AgentDeliveryPlan = {
   baseDelivery: SessionDeliveryTarget;
-  resolvedChannel: GatewayMessageChannel;
+  resolvedChannel: string;
+  plugin?: ChannelPlugin;
   resolvedTo?: string;
   resolvedAccountId?: string;
   resolvedThreadId?: string | number;
   deliveryTargetMode?: ChannelOutboundTargetMode;
+  resolvedSessionKey?: string;
   targetResolutionError?: Error;
 };
 
-export function resolveAgentDeliveryPlan(params: {
+function rebaseOutboundSessionRoute(
+  route: OutboundSessionRoute,
+  baseSessionKey: string,
+): OutboundSessionRoute | null {
+  if (route.baseSessionKey === baseSessionKey) {
+    return route;
+  }
+  if (route.sessionKey === route.baseSessionKey) {
+    return { ...route, sessionKey: baseSessionKey, baseSessionKey };
+  }
+  const basePrefix = `${route.baseSessionKey}:`;
+  if (!route.sessionKey.startsWith(basePrefix)) {
+    return null;
+  }
+  return {
+    ...route,
+    sessionKey: `${baseSessionKey}:${route.sessionKey.slice(basePrefix.length)}`,
+    baseSessionKey,
+  };
+}
+
+function resolveAgentDeliveryPlan(params: {
   sessionEntry?: SessionEntry;
   requestedChannel?: string;
   explicitTo?: string;
@@ -71,7 +100,7 @@ export function resolveAgentDeliveryPlan(params: {
       ? normalizedTurnSource
       : undefined;
   const turnSourceTo = normalizeOptionalString(params.turnSourceTo) ?? undefined;
-  const turnSourceAccountId = normalizeAccountId(params.turnSourceAccountId);
+  const turnSourceAccountId = normalizeOptionalAccountId(params.turnSourceAccountId);
   const turnSourceThreadId =
     params.turnSourceThreadId != null && params.turnSourceThreadId !== ""
       ? params.turnSourceThreadId
@@ -116,7 +145,7 @@ export function resolveAgentDeliveryPlan(params: {
       : undefined;
 
   const resolvedAccountId =
-    normalizeAccountId(params.accountId) ??
+    normalizeOptionalAccountId(params.accountId) ??
     (deliveryTargetMode === "implicit" ? baseDelivery.accountId : undefined);
 
   let resolvedTo = explicitTo;
@@ -143,49 +172,87 @@ export async function resolveAgentDeliveryPlanWithSessionRoute(
     cfg: OpenClawConfig;
     agentId: string;
     currentSessionKey?: string;
+    sessionRouteMode?: "plugin-only" | "allow-fallback";
+    /** Channel plugin already selected and bootstrapped by the caller. */
+    preparedPlugin?: ChannelPlugin;
   },
 ): Promise<AgentDeliveryPlan> {
   const plan = resolveAgentDeliveryPlan(params);
-  const { resolvedChannel, resolvedTo } = plan;
-  if (!params.wantsDelivery || !resolvedTo || !isDeliverableMessageChannel(resolvedChannel)) {
+  const { resolvedChannel } = plan;
+  if (!params.wantsDelivery || !isDeliverableMessageChannel(resolvedChannel)) {
     return plan;
   }
-  const plugin = resolveOutboundChannelPlugin({
-    channel: resolvedChannel,
-    cfg: params.cfg,
-    allowBootstrap: true,
-  });
-  if (!plugin?.messaging?.resolveOutboundSessionRoute) {
+  const plugin =
+    params.preparedPlugin ??
+    resolveOutboundChannelPlugin({
+      channel: resolvedChannel,
+      cfg: params.cfg,
+      allowBootstrap: true,
+    });
+  if (!plugin) {
     return plan;
   }
+  const pluginPlan = { ...plan, plugin };
+  const hasPluginSessionRoute = Boolean(plugin?.messaging?.resolveOutboundSessionRoute);
+  const hasPluginTargetResolver = Boolean(plugin?.messaging?.targetResolver);
+  // Only concrete plugin resolution makes a directory miss authoritative.
+  // Heuristic-only resolvers preserve the shipped normalized fallback.
+  const hasPluginConcreteTargetResolver = Boolean(plugin?.messaging?.targetResolver?.resolveTarget);
+  if (
+    !hasPluginSessionRoute &&
+    !hasPluginTargetResolver &&
+    params.sessionRouteMode !== "allow-fallback"
+  ) {
+    return pluginPlan;
+  }
+  const resolvedAccountId =
+    pluginPlan.resolvedAccountId ??
+    (params.sessionRouteMode === "allow-fallback"
+      ? resolveChannelDefaultAccountId({ plugin, cfg: params.cfg })
+      : undefined);
+  const routedPlan =
+    resolvedAccountId === pluginPlan.resolvedAccountId
+      ? pluginPlan
+      : { ...pluginPlan, resolvedAccountId };
   const normalizedTarget = resolveOutboundTarget({
     channel: resolvedChannel,
-    to: resolvedTo,
+    plugin,
+    to: routedPlan.resolvedTo,
     cfg: params.cfg,
-    accountId: plan.resolvedAccountId,
-    mode: plan.deliveryTargetMode ?? "explicit",
+    accountId: routedPlan.resolvedAccountId,
+    mode: routedPlan.deliveryTargetMode ?? "explicit",
   });
-  let sessionRouteTarget: string;
-  let resolvedSessionRouteTarget: ResolvedMessagingTarget | undefined;
-  if (normalizedTarget.ok) {
-    sessionRouteTarget = normalizedTarget.to;
-  } else {
-    if (!isReservedTargetLiteralError(normalizedTarget.error)) {
-      return { ...plan, targetResolutionError: normalizedTarget.error };
-    }
-    const resolvedTarget = await resolveChannelTarget({
-      cfg: params.cfg,
-      channel: resolvedChannel as ChannelId,
-      input: resolvedTo,
-      accountId: plan.resolvedAccountId,
-      unknownTargetMode: "normalized",
-      plugin,
-    });
-    if (!resolvedTarget.ok) {
-      return { ...plan, targetResolutionError: resolvedTarget.error };
-    }
-    sessionRouteTarget = resolvedTarget.target.to;
-    resolvedSessionRouteTarget = resolvedTarget.target;
+  const targetInput = normalizedTarget.ok ? normalizedTarget.to : routedPlan.resolvedTo;
+  if (!targetInput) {
+    return normalizedTarget.ok
+      ? routedPlan
+      : { ...routedPlan, targetResolutionError: normalizedTarget.error };
+  }
+  const resolvedTarget = await resolveChannelTarget({
+    cfg: params.cfg,
+    channel: resolvedChannel as ChannelId,
+    input: targetInput,
+    accountId: routedPlan.resolvedAccountId,
+    unknownTargetMode: hasPluginConcreteTargetResolver ? "error" : "normalized",
+    plugin,
+  });
+  if (!resolvedTarget.ok) {
+    return { ...routedPlan, targetResolutionError: resolvedTarget.error };
+  }
+  // An async normalized fallback cannot erase an earlier synchronous validation error.
+  if (!normalizedTarget.ok && resolvedTarget.target.resolutionSource === "normalized") {
+    return { ...routedPlan, targetResolutionError: normalizedTarget.error };
+  }
+  const sessionRouteTarget = resolvedTarget.target.to;
+  const resolvedSessionRouteTarget: ResolvedMessagingTarget | undefined =
+    !normalizedTarget.ok ||
+    normalizedTarget.to !== resolvedTarget.target.to ||
+    resolvedTarget.target.resolutionSource === "directory"
+      ? resolvedTarget.target
+      : undefined;
+  const resolvedPlan = { ...routedPlan, resolvedTo: sessionRouteTarget };
+  if (!hasPluginSessionRoute && params.sessionRouteMode !== "allow-fallback") {
+    return resolvedPlan;
   }
   const explicitThreadId =
     params.explicitThreadId != null && params.explicitThreadId !== ""
@@ -196,34 +263,148 @@ export async function resolveAgentDeliveryPlanWithSessionRoute(
       return await resolveOutboundSessionRoute({
         cfg: params.cfg,
         channel: resolvedChannel as ChannelId,
+        plugin,
         agentId: params.agentId,
-        accountId: plan.resolvedAccountId,
+        accountId: routedPlan.resolvedAccountId,
         target: sessionRouteTarget,
         ...(resolvedSessionRouteTarget ? { resolvedTarget: resolvedSessionRouteTarget } : {}),
         currentSessionKey: params.currentSessionKey,
-        threadId: plan.deliveryTargetMode === "explicit" ? explicitThreadId : plan.resolvedThreadId,
+        threadId:
+          routedPlan.deliveryTargetMode === "explicit"
+            ? explicitThreadId
+            : resolvedPlan.resolvedThreadId,
       });
     } catch {
       return null;
     }
   })();
-  if (!route) {
+  const globalDmScope = params.cfg.session?.dmScope ?? "main";
+  const bindingRoute =
+    route?.recipientSessionExact === true &&
+    route.chatType === "direct" &&
+    route.peer.kind === "direct"
+      ? resolveAgentRoute({
+          cfg: params.cfg,
+          channel: resolvedChannel,
+          accountId: routedPlan.resolvedAccountId,
+          peer: route.peer,
+        })
+      : null;
+  // Exact provider identities can reproduce binding-level DM isolation. Keep
+  // deterministic thread suffixes, but fail closed for opaque custom keys.
+  const bindingAwareRoute =
+    route &&
+    bindingRoute?.dmScope !== undefined &&
+    bindingRoute.dmScope !== globalDmScope &&
+    normalizeAgentId(bindingRoute.agentId) === normalizeAgentId(params.agentId)
+      ? rebaseOutboundSessionRoute(route, bindingRoute.sessionKey)
+      : route;
+  const knownNonExactRoute =
+    params.sessionRouteMode === "allow-fallback" &&
+    (bindingAwareRoute?.recipientSessionExact === false ||
+      bindingAwareRoute?.recipientSessionExact === "direct-alias");
+  // A best-effort alias is safe only when every direct recipient on this channel
+  // shares the selected agent's main session; binding overrides can isolate peers.
+  const canonicalMainSessionKey = buildAgentMainSessionKey({
+    agentId: params.agentId,
+    mainKey: params.cfg.session?.mainKey,
+  });
+  const usesCanonicalMainSession =
+    bindingAwareRoute?.recipientSessionExact === "direct-alias" &&
+    bindingAwareRoute.chatType === "direct" &&
+    bindingAwareRoute.sessionKey === bindingAwareRoute.baseSessionKey &&
+    bindingAwareRoute.sessionKey === canonicalMainSessionKey &&
+    globalDmScope === "main" &&
+    !listRouteBindings(params.cfg).some(
+      (binding) =>
+        binding.session?.dmScope !== undefined &&
+        binding.session.dmScope !== "main" &&
+        normalizeRouteBindingChannelId(binding.match.channel) === resolvedChannel,
+    );
+  // Stable outbound-only identities may resume each other, but never the shared
+  // agent main session. Omitted markers retain the external plugin contract.
+  const usesIsolatedDeliveryIdentity =
+    bindingAwareRoute?.recipientSessionExact === "delivery-identity" &&
+    bindingAwareRoute.baseSessionKey !== canonicalMainSessionKey &&
+    bindingAwareRoute.baseSessionKey.startsWith(
+      `agent:${normalizeAgentId(params.agentId)}:${resolvedChannel}:`,
+    ) &&
+    (bindingAwareRoute.sessionKey === bindingAwareRoute.baseSessionKey ||
+      bindingAwareRoute.sessionKey.startsWith(`${bindingAwareRoute.baseSessionKey}:`));
+  const selectedRoute =
+    bindingAwareRoute &&
+    (bindingAwareRoute.recipientSessionExact === "delivery-identity"
+      ? usesIsolatedDeliveryIdentity
+      : !knownNonExactRoute || usesCanonicalMainSession)
+      ? bindingAwareRoute
+      : null;
+  if (!selectedRoute) {
     if (resolvedSessionRouteTarget) {
       return {
-        ...plan,
+        ...resolvedPlan,
         resolvedTo: resolvedSessionRouteTarget.to,
         resolvedThreadId:
-          plan.deliveryTargetMode === "explicit" ? explicitThreadId : plan.resolvedThreadId,
+          resolvedPlan.deliveryTargetMode === "explicit"
+            ? explicitThreadId
+            : resolvedPlan.resolvedThreadId,
       };
     }
-    return plan;
+    return resolvedPlan;
   }
   return {
-    ...plan,
-    resolvedTo: route.to,
+    ...resolvedPlan,
+    resolvedSessionKey: selectedRoute.sessionKey,
+    // Generic routes use portable user/channel prefixes. Delivery still needs the
+    // plugin-normalized target; only provider-owned route hooks may replace it.
+    resolvedTo: hasPluginSessionRoute
+      ? selectedRoute.to
+      : (resolvedSessionRouteTarget?.to ?? sessionRouteTarget),
     resolvedThreadId:
-      route.threadId ??
-      (plan.deliveryTargetMode === "explicit" ? explicitThreadId : plan.resolvedThreadId),
+      selectedRoute.threadId ??
+      (resolvedPlan.deliveryTargetMode === "explicit"
+        ? explicitThreadId
+        : resolvedPlan.resolvedThreadId),
+  };
+}
+
+/** Resolves an explicit recipient into its canonical or stable provider-owned session. */
+export async function resolveAgentExplicitRecipientSession(params: {
+  cfg: OpenClawConfig;
+  agentId: string;
+  channel: string;
+  to: string;
+  accountId?: string;
+  threadId?: string | number;
+}): Promise<{
+  sessionKey?: string;
+  channel?: string;
+  to?: string;
+  accountId?: string;
+  threadId?: string | number;
+  error?: Error;
+}> {
+  const plan = await resolveAgentDeliveryPlanWithSessionRoute({
+    cfg: params.cfg,
+    agentId: params.agentId,
+    requestedChannel: params.channel,
+    explicitTo: params.to,
+    explicitThreadId: params.threadId,
+    accountId: params.accountId,
+    wantsDelivery: true,
+    sessionRouteMode: "allow-fallback",
+  });
+  if (!plan.resolvedSessionKey && !plan.targetResolutionError) {
+    return {
+      error: new Error(`Unable to resolve a session route for channel "${params.channel}"`),
+    };
+  }
+  return {
+    sessionKey: plan.resolvedSessionKey,
+    channel: plan.resolvedChannel,
+    to: plan.resolvedTo,
+    accountId: plan.resolvedAccountId,
+    threadId: plan.resolvedThreadId,
+    error: plan.targetResolutionError,
   };
 }
 
@@ -264,6 +445,7 @@ export function resolveAgentOutboundTarget(params: {
   }
   const resolvedTarget = resolveOutboundTarget({
     channel: params.plan.resolvedChannel,
+    ...(params.plan.plugin ? { plugin: params.plan.plugin } : {}),
     to: params.plan.resolvedTo,
     cfg: params.cfg,
     accountId: params.plan.resolvedAccountId,

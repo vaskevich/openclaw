@@ -1,7 +1,11 @@
 // Tests group prompt helpers and lazy runtime loading for group metadata.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { OpenClawConfig } from "../../config/config.js";
-import { resetPluginRuntimeStateForTest } from "../../plugins/runtime.js";
+import { resetPluginRuntimeStateForTest, setActivePluginRegistry } from "../../plugins/runtime.js";
+import {
+  createChannelTestPluginBase,
+  createTestRegistry,
+} from "../../test-utils/channel-plugins.js";
 import * as groups from "./groups.js";
 
 describe("group runtime loading", () => {
@@ -31,10 +35,10 @@ describe("group runtime loading", () => {
     });
     expect(groupChatContext).toContain("You are in a WhatsApp group chat.");
     expect(groupChatContext).toContain(
-      "Your text replies are automatically sent to this group chat.",
+      "Your text replies are automatically sent to this group chat unless the current-turn context says final replies stay private.",
     );
     expect(groupChatContext).toContain(
-      "For ordinary text, do not use the message tool to send to this same destination; just reply normally.",
+      "For ordinary text, do not use the message tool to send to this same destination unless the current-turn context asks for visible output via message(action=send).",
     );
     expect(groupChatContext).toContain(
       "Use message(action=send) only when you need to send files, images, or other attachments to this same group/topic.",
@@ -61,6 +65,9 @@ describe("group runtime loading", () => {
     expect(toolOnlyContext).toContain("wrap bare URLs");
     expect(toolOnlyContext).toContain("<https://example.com>");
     expect(toolOnlyContext).toContain("do not call message(action=send)");
+    expect(toolOnlyContext).toContain(
+      "Be extremely selective: reply only when directly addressed or clearly helpful.",
+    );
     expect(toolOnlyContext).not.toContain('reply with exactly "NO_REPLY"');
     const channelToolOnlyContext = isolatedGroups.buildGroupChatContext({
       sessionCtx: { ChatType: "channel", Provider: "mattermost" },
@@ -72,19 +79,20 @@ describe("group runtime loading", () => {
     expect(channelToolOnlyContext).toContain("posted to this channel");
     expect(channelToolOnlyContext).not.toContain("visible group response");
     expect(channelToolOnlyContext).not.toContain("posted to the group");
-    const telegramContext = isolatedGroups.buildGroupChatContext({
-      sessionCtx: { ChatType: "group", Provider: "telegram" },
-      silentReplyPolicy: "allow",
-      silentToken: "NO_REPLY",
-    });
-    expect(telegramContext).toContain("Write like a human. Minimize empty lines");
-    expect(telegramContext).not.toContain("Avoid Markdown tables");
     expect(
       isolatedGroups.buildGroupIntro({
-        cfg: {} as OpenClawConfig,
-        sessionCtx: { Provider: "whatsapp" },
         defaultActivation: "mention",
-        silentToken: "NO_REPLY",
+      }),
+    ).toContain("Activation: trigger-only");
+    expect(
+      isolatedGroups.buildGroupIntro({
+        defaultActivation: "always",
+      }),
+    ).toContain("You see every message; most need no response. When you do reply");
+    expect(
+      isolatedGroups.buildGroupIntro({
+        sessionEntry: { groupActivation: "mention" } as never,
+        defaultActivation: "always",
       }),
     ).toContain("Activation: trigger-only");
     expect(groupsRuntimeLoads).not.toHaveBeenCalled();
@@ -97,7 +105,7 @@ describe("group runtime loading", () => {
         sessionCtx: { ChatType: "direct", Provider: "telegram" },
       }),
     ).toBe(
-      "You are in a Telegram direct conversation. Your replies are automatically sent to this conversation.",
+      "You are in a Telegram direct conversation. Your replies are automatically sent to this conversation unless the current-turn context says final replies stay private.",
     );
     expect(
       groups.buildDirectChatContext({
@@ -114,6 +122,39 @@ describe("group runtime loading", () => {
     expect(toolOnlyContext).toContain("do not call message(action=send)");
     expect(toolOnlyContext).not.toContain("NO_REPLY");
     expect(toolOnlyContext).not.toContain("Your replies are automatically sent");
+  });
+
+  it("reads markdown table guidance from channel metadata", () => {
+    setActivePluginRegistry(
+      createTestRegistry([
+        {
+          pluginId: "table-chat",
+          source: "test",
+          plugin: {
+            ...createChannelTestPluginBase({ id: "table-chat" }),
+            messaging: { defaultMarkdownTableMode: "off" },
+          },
+        },
+        {
+          pluginId: "telegram",
+          source: "test",
+          plugin: {
+            ...createChannelTestPluginBase({ id: "telegram" }),
+            messaging: { defaultMarkdownTableMode: "block" },
+          },
+        },
+      ]),
+    );
+
+    expect(groups.buildGroupChatContext({ sessionCtx: { Provider: "table-chat" } })).not.toContain(
+      "Avoid Markdown tables",
+    );
+    expect(groups.buildGroupChatContext({ sessionCtx: { Provider: "telegram" } })).not.toContain(
+      "Avoid Markdown tables",
+    );
+    expect(groups.buildGroupChatContext({ sessionCtx: { Provider: "plain-chat" } })).toContain(
+      "Avoid Markdown tables",
+    );
   });
 
   it("gates group silent-token instructions on the resolved silent reply policy", () => {
@@ -139,8 +180,8 @@ describe("group runtime loading", () => {
     expect(disallowed).not.toContain("Never say that you are staying quiet");
   });
 
-  it("binds an explicitly mentioned channel handle to the current assistant identity", () => {
-    const context = groups.buildGroupChatContext({
+  it("keeps per-message mention state out of stable group context", () => {
+    const mentioned = groups.buildGroupChatContext({
       sessionCtx: {
         ChatType: "group",
         Provider: "telegram",
@@ -151,19 +192,19 @@ describe("group runtime loading", () => {
       silentReplyPolicy: "allow",
     });
 
-    expect(context).toContain("explicitly mentions your channel identity @SirPinchALotBot");
-    expect(context).toContain("Treat that mention as addressed to you");
-
     const notExplicit = groups.buildGroupChatContext({
       sessionCtx: {
         ChatType: "group",
         Provider: "telegram",
-        BotUsername: "kesslerAIBot",
+        BotUsername: "SirPinchALotBot",
+        ExplicitlyMentionedBot: false,
       },
       silentToken: "NO_REPLY",
       silentReplyPolicy: "allow",
     });
-    expect(notExplicit).not.toContain("channel identity @kesslerAIBot");
+
+    expect(mentioned).toBe(notExplicit);
+    expect(mentioned).not.toContain("channel identity @SirPinchALotBot");
   });
 
   it("uses channel wording when the authoritative chat type is channel", () => {
@@ -174,44 +215,15 @@ describe("group runtime loading", () => {
     });
 
     expect(context).toContain("You are in a Mattermost channel.");
-    expect(context).toContain("Your text replies are automatically sent to this channel.");
+    expect(context).toContain(
+      "Your text replies are automatically sent to this channel unless the current-turn context says final replies stay private.",
+    );
     expect(context).toContain("do not use the message tool to send to this same destination");
     expect(context).toContain("attachments to this same channel/thread");
     expect(context).not.toContain("group chat");
   });
 
-  it("marks non-visible assistant replies silent for groups with silence allowed", () => {
-    expect(
-      groups.resolveGroupSilentReplyBehavior({
-        defaultActivation: "always",
-        silentReplyPolicy: "allow",
-      }).allowEmptyAssistantReplyAsSilent,
-    ).toBe(true);
-
-    expect(
-      groups.resolveGroupSilentReplyBehavior({
-        defaultActivation: "mention",
-        silentReplyPolicy: "allow",
-      }).allowEmptyAssistantReplyAsSilent,
-    ).toBe(true);
-
-    expect(
-      groups.resolveGroupSilentReplyBehavior({
-        sessionEntry: { groupActivation: "mention" } as never,
-        defaultActivation: "always",
-        silentReplyPolicy: "allow",
-      }).allowEmptyAssistantReplyAsSilent,
-    ).toBe(true);
-
-    expect(
-      groups.resolveGroupSilentReplyBehavior({
-        defaultActivation: "always",
-        silentReplyPolicy: "disallow",
-      }).allowEmptyAssistantReplyAsSilent,
-    ).toBe(false);
-  });
-
-  it("resolves requireMention through runtime and Discord fallback paths", async () => {
+  it("resolves requireMention through runtime and generic fallback paths", async () => {
     vi.resetModules();
     const groupsRuntimeLoads = vi.fn();
     vi.doMock("./groups.runtime.js", () => {
@@ -243,72 +255,6 @@ describe("group runtime loading", () => {
           key: "slack:group:C123",
           channel: "slack",
           id: "C123",
-          chatType: "group",
-        },
-      }),
-    ).resolves.toBe(false);
-    expect(groupsRuntimeLoads).toHaveBeenCalledTimes(1);
-
-    await expect(
-      isolatedGroups.resolveGroupRequireMention({
-        cfg: {
-          channels: {
-            discord: {
-              guilds: {
-                G1: {
-                  requireMention: true,
-                  channels: {
-                    C1: { requireMention: false },
-                  },
-                },
-              },
-            },
-          },
-        } as unknown as OpenClawConfig,
-        ctx: {
-          Provider: "discord",
-          From: "discord:channel:C1",
-          GroupSpace: "G1",
-          GroupChannel: "general",
-        },
-        groupResolution: {
-          key: "discord:channel:C1",
-          channel: "discord",
-          id: "C1",
-          chatType: "group",
-        },
-      }),
-    ).resolves.toBe(false);
-
-    await expect(
-      isolatedGroups.resolveGroupRequireMention({
-        cfg: {
-          channels: {
-            discord: {
-              guilds: {
-                G1: { requireMention: true },
-              },
-              accounts: {
-                work: {
-                  guilds: {
-                    G1: { requireMention: false },
-                  },
-                },
-              },
-            },
-          },
-        } as unknown as OpenClawConfig,
-        ctx: {
-          Provider: "discord",
-          From: "discord:channel:C1",
-          GroupSpace: "G1",
-          GroupChannel: "general",
-          AccountId: "work",
-        },
-        groupResolution: {
-          key: "discord:channel:C1",
-          channel: "discord",
-          id: "C1",
           chatType: "group",
         },
       }),

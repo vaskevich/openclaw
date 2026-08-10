@@ -13,6 +13,7 @@ import {
 import { checkUpdateStatus } from "../../infra/update-check.js";
 import { defaultRuntime } from "../../runtime.js";
 import { pathExists } from "../../utils.js";
+import { VERSION } from "../../version.js";
 import {
   isEmptyDir,
   isGitCheckout,
@@ -27,7 +28,7 @@ import { updateCommand } from "./update-command.js";
 export async function updateWizardCommand(opts: UpdateWizardOptions = {}): Promise<void> {
   if (!process.stdin.isTTY) {
     defaultRuntime.error(
-      "Update wizard requires a TTY. Use `openclaw update --channel <stable|beta|dev>` instead.",
+      "Update wizard requires a TTY. Use `openclaw update --channel <stable|extended-stable|beta|dev>` instead.",
     );
     defaultRuntime.exit(1);
     return;
@@ -54,6 +55,7 @@ export async function updateWizardCommand(opts: UpdateWizardOptions = {}): Promi
     : null;
   const channelInfo = resolveEffectiveUpdateChannel({
     configChannel,
+    currentVersion: VERSION,
     installKind: updateStatus.installKind,
     git: updateStatus.git
       ? { tag: updateStatus.git.tag, branch: updateStatus.git.branch }
@@ -78,6 +80,11 @@ export async function updateWizardCommand(opts: UpdateWizardOptions = {}): Promi
         value: "stable",
         label: "Stable",
         hint: "Tagged releases (npm latest)",
+      },
+      {
+        value: "extended-stable",
+        label: "Extended Stable",
+        hint: "Monthly supported release (npm extended-stable)",
       },
       {
         value: "beta",

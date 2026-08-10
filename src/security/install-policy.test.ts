@@ -1,8 +1,8 @@
 // Covers install-policy checks for packages and plugin installs.
 import fs from "node:fs/promises";
-import os from "node:os";
 import path from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { useAutoCleanupTempDirTracker } from "../../test/helpers/temp-dir.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import {
   killPidIfAlive,
@@ -10,25 +10,15 @@ import {
   waitForPidToExit,
   writeForkingNoOutputScript,
 } from "../test-utils/process-tree.js";
-import {
-  runInstallPolicy,
-  validateInstallPolicyStatic,
-  type InstallPolicyRequest,
-} from "./install-policy.js";
+import { runInstallPolicy, validateInstallPolicyStatic } from "./install-policy.js";
 
-const tempDirs: string[] = [];
-
-async function makeTempDir(): Promise<string> {
-  const dir = await fs.mkdtemp(path.join(os.tmpdir(), "openclaw-install-policy-"));
-  tempDirs.push(dir);
-  return dir;
-}
+type InstallPolicyRequest = Parameters<typeof runInstallPolicy>[0]["request"];
 
 async function writePolicyScript(dir: string): Promise<string> {
   const scriptPath = path.join(dir, "policy.cjs");
   await fs.writeFile(
     scriptPath,
-    `
+    `#!${process.execPath}
 const fs = require("node:fs");
 
 let input = "";
@@ -103,10 +93,9 @@ function configWithPolicy(scriptPath: string, env: Record<string, string>): Open
         enabled: true,
         exec: {
           source: "exec",
-          command: process.execPath,
-          args: [scriptPath],
+          command: scriptPath,
           env,
-          allowInsecurePath: true,
+          trustedDirs: [path.dirname(scriptPath)],
           timeoutMs: 5000,
           maxOutputBytes: 16 * 1024,
         },
@@ -116,18 +105,13 @@ function configWithPolicy(scriptPath: string, env: Record<string, string>): Open
 }
 
 describe("runInstallPolicy", () => {
+  const tempDirs = useAutoCleanupTempDirTracker(afterEach);
   let sourceDir: string;
   let scriptPath: string;
 
   beforeEach(async () => {
-    sourceDir = await makeTempDir();
+    sourceDir = tempDirs.make("openclaw-install-policy-");
     scriptPath = await writePolicyScript(sourceDir);
-  });
-
-  afterEach(async () => {
-    await Promise.all(
-      tempDirs.splice(0).map((dir) => fs.rm(dir, { recursive: true, force: true })),
-    );
   });
 
   it("does nothing when install policy is disabled", async () => {
@@ -175,7 +159,9 @@ describe("runInstallPolicy", () => {
       mutable: false,
       network: true,
     });
-    await expect(fs.readFile(cwdPath, "utf8")).resolves.toBe(path.dirname(process.execPath));
+    await expect(fs.readFile(cwdPath, "utf8")).resolves.toBe(
+      await fs.realpath(path.dirname(scriptPath)),
+    );
     expect(captured.request).toMatchObject({
       kind: "skill-install",
       mode: "install",
@@ -203,7 +189,7 @@ describe("runInstallPolicy", () => {
                 POLICY_RESPONSE: response,
               },
               passEnv: ["PATH"],
-              allowInsecurePath: true,
+              trustedDirs: [path.dirname(envNodeScriptPath)],
             },
           },
         },
@@ -223,9 +209,20 @@ describe("runInstallPolicy", () => {
       const forkScriptPath = await writeForkingNoOutputScript(sourceDir);
       const pidPath = path.join(sourceDir, "forked.pid");
       let childPid: number | undefined;
+      const nativeSetTimeout = globalThis.setTimeout;
+      const noOutputTimeouts: Array<() => void> = [];
+      const setTimeoutSpy = vi
+        .spyOn(globalThis, "setTimeout")
+        .mockImplementation((callback, delay, ...args) => {
+          if (delay === 1_000) {
+            noOutputTimeouts.push(() => callback(...args));
+            return nativeSetTimeout(() => undefined, 60_000);
+          }
+          return nativeSetTimeout(callback, delay, ...args);
+        });
 
       try {
-        const result = await runInstallPolicy({
+        const resultPromise = runInstallPolicy({
           config: {
             security: {
               installPolicy: {
@@ -234,20 +231,31 @@ describe("runInstallPolicy", () => {
                   source: "exec",
                   command: forkScriptPath,
                   env: { NODE_BINARY: process.execPath, PID_FILE: pidPath },
-                  allowInsecurePath: true,
-                  noOutputTimeoutMs: 150,
-                  timeoutMs: 2000,
+                  trustedDirs: [path.dirname(forkScriptPath)],
+                  // Preserve production-like startup headroom; the test fires
+                  // the re-armed timer only after the readiness byte arrives.
+                  noOutputTimeoutMs: 1_000,
+                  timeoutMs: 10_000,
                 },
               },
             },
           },
           request: baseRequest(sourceDir),
         });
+        await vi.waitFor(
+          () => {
+            expect(noOutputTimeouts.length).toBeGreaterThanOrEqual(2);
+          },
+          { timeout: 5_000 },
+        );
+        childPid = await readPidFile(pidPath);
+        noOutputTimeouts.at(-1)?.();
+        const result = await resultPromise;
 
         expect(result?.blocked?.reason).toContain("policy command produced no output");
-        childPid = await readPidFile(pidPath);
-        expect(await waitForPidToExit(childPid)).toBe(true);
+        expect(await waitForPidToExit(childPid, 5_000)).toBe(true);
       } finally {
+        setTimeoutSpy.mockRestore();
         killPidIfAlive(childPid);
       }
     },
@@ -290,7 +298,7 @@ describe("runInstallPolicy", () => {
             env: {
               EXIT_CODE: "1",
             },
-            allowInsecurePath: true,
+            trustedDirs: [path.dirname(scriptPath)],
           },
         },
       },
@@ -322,6 +330,25 @@ describe("runInstallPolicy", () => {
     expect(warnings.join("\n")).toContain("target=skill:weather");
     expect(warnings.join("\n")).toContain("source=clawhub/openclaw");
     expect(warnings.join("\n")).toContain("blocked by install policy");
+  });
+
+  it("keeps truncated operator block reasons UTF-16 safe", async () => {
+    const reasonPrefix = "r".repeat(999);
+    const result = await runInstallPolicy({
+      config: configWithPolicy(scriptPath, {
+        POLICY_RESPONSE: JSON.stringify({
+          protocolVersion: 1,
+          decision: "block",
+          reason: `${reasonPrefix}🎉tail`,
+        }),
+      }),
+      request: baseRequest(sourceDir),
+    });
+
+    expect(result?.blocked).toEqual({
+      code: "security_scan_blocked",
+      reason: `blocked by install policy: ${reasonPrefix}...`,
+    });
   });
 
   it("preserves allow findings without file or line", async () => {
@@ -430,7 +457,6 @@ describe("runInstallPolicy", () => {
               source: "exec",
               command: "policy.cjs",
               args: [],
-              allowInsecurePath: true,
             },
           },
         },
@@ -456,7 +482,6 @@ describe("runInstallPolicy", () => {
                 source: "exec",
                 command: "C:\\tmp\\policy.cjs",
                 args: [],
-                allowInsecurePath: true,
               },
             },
           },
@@ -497,7 +522,7 @@ describe("runInstallPolicy", () => {
     if (process.platform === "win32") {
       return;
     }
-    const dir = await makeTempDir();
+    const dir = tempDirs.make("openclaw-install-policy-");
     const writableDir = path.join(dir, "writable-parent");
     await fs.mkdir(writableDir, { recursive: true });
     await fs.chmod(writableDir, 0o777);
@@ -524,7 +549,7 @@ describe("runInstallPolicy", () => {
     if (process.platform === "win32") {
       return;
     }
-    const dir = await makeTempDir();
+    const dir = tempDirs.make("openclaw-install-policy-");
     const writableDir = path.join(dir, "writable-parent");
     await fs.mkdir(writableDir, { recursive: true });
     await fs.chmod(writableDir, 0o777);
@@ -552,7 +577,7 @@ describe("runInstallPolicy", () => {
     if (process.platform === "win32") {
       return;
     }
-    const dir = await makeTempDir();
+    const dir = tempDirs.make("openclaw-install-policy-");
     const writableDir = path.join(dir, "writable-parent");
     await fs.mkdir(writableDir, { recursive: true });
     await fs.chmod(writableDir, 0o777);
@@ -580,7 +605,7 @@ describe("runInstallPolicy", () => {
     if (process.platform === "win32") {
       return;
     }
-    const dir = await makeTempDir();
+    const dir = tempDirs.make("openclaw-install-policy-");
     const writableDir = path.join(dir, "writable-parent");
     await fs.mkdir(writableDir, { recursive: true });
     await fs.chmod(writableDir, 0o777);
@@ -604,33 +629,29 @@ describe("runInstallPolicy", () => {
     );
   });
 
-  it.runIf(process.platform !== "win32")(
-    "rejects symlinked interpreter script args even when command symlinks are allowed",
-    async () => {
-      const dir = await makeTempDir();
-      const realScriptPath = await writePolicyScript(dir);
-      const symlinkScriptPath = path.join(dir, "policy-link.cjs");
-      await fs.symlink(realScriptPath, symlinkScriptPath);
+  it.runIf(process.platform !== "win32")("rejects symlinked interpreter script args", async () => {
+    const dir = tempDirs.make("openclaw-install-policy-");
+    const realScriptPath = await writePolicyScript(dir);
+    const symlinkScriptPath = path.join(dir, "policy-link.cjs");
+    await fs.symlink(realScriptPath, symlinkScriptPath);
 
-      const validation = await validateInstallPolicyStatic({
-        security: {
-          installPolicy: {
-            enabled: true,
-            exec: {
-              source: "exec",
-              command: process.execPath,
-              args: [symlinkScriptPath],
-              allowSymlinkCommand: true,
-            },
+    const validation = await validateInstallPolicyStatic({
+      security: {
+        installPolicy: {
+          enabled: true,
+          exec: {
+            source: "exec",
+            command: process.execPath,
+            args: [symlinkScriptPath],
           },
         },
-      });
+      },
+    });
 
-      expect(validation.issues.map((issue) => issue.message)).toContain(
-        `security.installPolicy.exec.args[0] must not be a symlink: ${symlinkScriptPath}`,
-      );
-    },
-  );
+    expect(validation.issues.map((issue) => issue.message)).toContain(
+      `security.installPolicy.exec.args[0] must not be a symlink: ${symlinkScriptPath}`,
+    );
+  });
 
   it.runIf(process.platform !== "win32")(
     "rejects env policy commands before interpreter resolution can bypass validation",
@@ -643,7 +664,6 @@ describe("runInstallPolicy", () => {
               source: "exec",
               command: "/usr/bin/env",
               args: ["-S", `node ${scriptPath}`],
-              allowInsecurePath: true,
             },
           },
         },

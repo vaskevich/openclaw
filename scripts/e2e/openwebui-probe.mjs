@@ -1,6 +1,10 @@
 // Probe script for OpenWebUI E2E connectivity.
 import { Agent, setGlobalDispatcher } from "undici";
-import { readBoundedResponseText as readBoundedResponseTextWithLimit } from "./lib/bounded-response-text.mjs";
+import {
+  createBoundedResponseTooLargeError,
+  readBoundedResponseText as readBoundedResponseTextWithLimit,
+} from "../lib/bounded-response.mjs";
+import { escapeRegExp } from "../lib/regexp.mjs";
 
 const baseUrl = process.env.OPENWEBUI_BASE_URL ?? "";
 const email = process.env.OPENWEBUI_ADMIN_EMAIL ?? "";
@@ -111,12 +115,10 @@ async function withRequestTimeout(label, timeoutMs, run) {
 }
 
 async function readBoundedResponseText(response, label, timeoutPromise) {
-  return await readBoundedResponseTextWithLimit(
-    response,
-    label,
-    responseBodyMaxBytes,
+  return await readBoundedResponseTextWithLimit(response, label, responseBodyMaxBytes, {
+    createTooLargeError: createBoundedResponseTooLargeError,
     timeoutPromise,
-  );
+  });
 }
 
 async function readBoundedResponseJson(response, label, timeoutPromise) {
@@ -158,10 +160,6 @@ function sleep(ms) {
   });
 }
 
-function escapeRegExp(value) {
-  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-
 function redactDiagnosticText(text, extraSecrets = []) {
   let redacted = text
     .replace(/Bearer\s+[A-Za-z0-9._~+/=-]+/giu, "Bearer <redacted>")
@@ -194,8 +192,11 @@ function cookieSecretValues(cookieHeader) {
 }
 
 function authDiagnosticSecretValues(authHeaders) {
-  const authorization = typeof authHeaders.authorization === "string" ? authHeaders.authorization : "";
-  const bearerToken = authorization.startsWith("Bearer ") ? authorization.slice("Bearer ".length) : "";
+  const authorization =
+    typeof authHeaders.authorization === "string" ? authHeaders.authorization : "";
+  const bearerToken = authorization.startsWith("Bearer ")
+    ? authorization.slice("Bearer ".length)
+    : "";
   const cookie = typeof authHeaders.cookie === "string" ? authHeaders.cookie : "";
   return [bearerToken, authorization, cookie, ...cookieSecretValues(cookie)].filter(Boolean);
 }

@@ -1,19 +1,13 @@
-// Real process coverage for extension exec tree cleanup.
 import { spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, realpathSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
-import { execCommand, type ExecResult } from "./exec.js";
-
-const DEFAULT_OUTPUT_LIMIT_CHARS = 16 * 1024 * 1024;
+import { afterEach, describe, expect, it, vi } from "vitest";
+import { execCommand } from "./exec.js";
 
 const cleanupPids = new Set<number>();
 
-function isProcessAlive(pid: number | undefined): boolean {
-  if (!pid || !Number.isFinite(pid)) {
-    return false;
-  }
+function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);
     return true;
@@ -27,124 +21,28 @@ function forceKillPid(pid: number): void {
     return;
   }
   if (process.platform === "win32") {
-    spawnSync("taskkill", ["/F", "/T", "/PID", String(pid)], { stdio: "ignore" });
+    spawnSync("taskkill", ["/F", "/T", "/PID", String(pid)], {
+      stdio: "ignore",
+      timeout: 5_000,
+      windowsHide: true,
+    });
     return;
   }
   try {
     process.kill(pid, "SIGKILL");
   } catch {
-    // Already gone.
+    // The process exited between the liveness check and cleanup.
   }
 }
 
-async function waitForGone(pid: number, timeoutMs: number): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (!isProcessAlive(pid)) {
-      return true;
-    }
-    await new Promise((resolve) => {
-      setTimeout(resolve, 25);
-    });
-  }
-  return !isProcessAlive(pid);
-}
-
-async function waitForFile(path: string, timeoutMs: number): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (existsSync(path)) {
-      return;
-    }
-    await new Promise((resolve) => {
-      setTimeout(resolve, 25);
-    });
-  }
-  throw new Error(`timed out waiting for ${path}`);
-}
-
-function readReadyPid(path: string): number {
-  const pid = Number(readFileSync(path, "utf8").trim());
-  if (!Number.isInteger(pid) || pid <= 0) {
-    throw new Error(`invalid descendant pid: ${pid}`);
-  }
-  return pid;
-}
-
-type Trigger = "abort" | "output-limit" | "timeout";
-
-async function runProcessTreeProof(
-  trigger: Trigger,
-  options: { ignoreDescendantSigterm?: boolean } = {},
-): Promise<{ descendantPid: number; result: ExecResult }> {
-  const dir = mkdtempSync(join(tmpdir(), "openclaw-exec-tree-"));
-  const readyPath = join(dir, "ready");
-  const triggerPath = join(dir, "trigger");
-  const childScript = `
-const fs = require("node:fs");
-${options.ignoreDescendantSigterm ? "process.on('SIGTERM', () => {});" : ""}
-fs.writeFileSync(${JSON.stringify(readyPath)}, String(process.pid));
-setInterval(() => {}, 1000);
-`;
-  const outputFlood =
-    trigger === "output-limit"
-      ? `process.stdout.write("x".repeat(${DEFAULT_OUTPUT_LIMIT_CHARS + 1}));`
-      : "";
-  const parentScript = `
-const { spawn } = require("node:child_process");
-const fs = require("node:fs");
-const child = spawn(process.execPath, ["-e", ${JSON.stringify(childScript)}], {
-  detached: false,
-  stdio: ["ignore", "ignore", "ignore"],
-});
-const deadline = Date.now() + 5000;
-while (!fs.existsSync(${JSON.stringify(readyPath)})) {
-  if (Date.now() > deadline) {
-    throw new Error("descendant did not become ready");
-  }
-}
-console.log("descendant_pid=" + child.pid);
-if (${trigger === "output-limit" ? "true" : "false"}) {
-  const deadline = Date.now() + 5000;
-  while (!fs.existsSync(${JSON.stringify(triggerPath)})) {
-    if (Date.now() > deadline) {
-      throw new Error("output trigger did not arrive");
-    }
-  }
-  ${outputFlood}
-}
-process.on("SIGTERM", () => process.exit(0));
-setInterval(() => {}, 1000);
-`;
-
-  const controller = new AbortController();
-  const resultPromise = execCommand(process.execPath, ["-e", parentScript], process.cwd(), {
-    signal: controller.signal,
-    // The timeout clock starts with execCommand. Keep it long enough for the
-    // descendant PID handshake so cleanup failures stay tracked by afterEach.
-    timeout: trigger === "timeout" ? 2000 : undefined,
+async function waitForFile(filePath: string, timeoutMs: number): Promise<void> {
+  await vi.waitFor(() => expect(existsSync(filePath)).toBe(true), {
+    timeout: timeoutMs,
+    interval: 25,
   });
-  try {
-    await waitForFile(readyPath, 5000);
-    const descendantPid = readReadyPid(readyPath);
-    cleanupPids.add(descendantPid);
-    if (trigger === "abort") {
-      controller.abort();
-    } else if (trigger === "output-limit") {
-      writeFileSync(triggerPath, "go");
-    }
-    const result = await resultPromise;
-    return { descendantPid, result };
-  } catch (error) {
-    controller.abort();
-    await resultPromise.catch(() => undefined);
-    throw error;
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
 }
 
-describe("execCommand real process-tree cleanup", () => {
+describe("execCommand process-tree cleanup", () => {
   afterEach(() => {
     for (const pid of cleanupPids) {
       forceKillPid(pid);
@@ -152,31 +50,44 @@ describe("execCommand real process-tree cleanup", () => {
     cleanupPids.clear();
   });
 
-  it("waits until timeout cleanup removes a SIGTERM-resistant descendant", async () => {
-    const { descendantPid, result } = await runProcessTreeProof("timeout", {
-      ignoreDescendantSigterm: true,
-    });
+  it("does not resolve a timeout while a SIGTERM-resistant descendant is alive", async () => {
+    const dir = mkdtempSync(join(realpathSync(tmpdir()), "openclaw-exec-tree-"));
+    const readyPath = join(dir, "ready.json");
+    const descendantScript = [
+      "process.on('SIGTERM', () => {});",
+      "setInterval(() => {}, 1000);",
+    ].join("\n");
+    const parentScript = [
+      'const { spawn } = require("node:child_process");',
+      'const fs = require("node:fs");',
+      `const child = spawn(process.execPath, ["-e", ${JSON.stringify(descendantScript)}], { stdio: "ignore", windowsHide: true });`,
+      `child.once("spawn", () => fs.writeFileSync(${JSON.stringify(readyPath)}, JSON.stringify({ parentPid: process.pid, childPid: child.pid })));`,
+      "child.once('error', () => process.exit(1));",
+      "setInterval(() => {}, 1000);",
+    ].join("\n");
 
-    expect(result.killed).toBe(true);
-    expect(result.outputLimitExceeded).toBeUndefined();
-    expect(await waitForGone(descendantPid, 250)).toBe(true);
-  }, 15_000);
+    try {
+      const resultPromise = execCommand(process.execPath, ["-e", parentScript], process.cwd(), {
+        timeout: 1_000,
+      });
+      await waitForFile(readyPath, 3_000);
+      const pids = JSON.parse(readFileSync(readyPath, "utf8")) as {
+        parentPid: number;
+        childPid: number;
+      };
+      cleanupPids.add(pids.parentPid);
+      cleanupPids.add(pids.childPid);
 
-  it("removes a wrapper descendant after abort", async () => {
-    const { descendantPid, result } = await runProcessTreeProof("abort");
-
-    expect(result.killed).toBe(true);
-    expect(await waitForGone(descendantPid, 250)).toBe(true);
-  });
-
-  it("removes a wrapper descendant after default output overflow", async () => {
-    const { descendantPid, result } = await runProcessTreeProof("output-limit");
-
-    expect(result).toMatchObject({
-      killed: true,
-      code: 1,
-      outputLimitExceeded: "stdout",
-    });
-    expect(await waitForGone(descendantPid, 250)).toBe(true);
-  }, 10_000);
+      await expect(resultPromise).resolves.toMatchObject({ killed: true });
+      await vi.waitFor(
+        () => {
+          expect(isProcessAlive(pids.parentPid)).toBe(false);
+          expect(isProcessAlive(pids.childPid)).toBe(false);
+        },
+        { timeout: 500, interval: 25 },
+      );
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 12_000);
 });

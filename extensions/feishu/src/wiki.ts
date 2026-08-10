@@ -5,7 +5,7 @@ import type { OpenClawPluginApi } from "../runtime-api.js";
 import { listEnabledFeishuAccounts } from "./accounts.js";
 import { createFeishuToolClient, resolveAnyEnabledFeishuToolsConfig } from "./tool-account.js";
 import {
-  jsonToolResult,
+  feishuExternalToolResult as jsonResult,
   toolExecutionErrorResult,
   unknownToolActionResult,
 } from "./tool-result.js";
@@ -226,6 +226,7 @@ export function registerFeishuWikiTools(api: OpenClawPluginApi) {
       const defaultAccountId = ctx.agentAccountId;
       return {
         name: "feishu_wiki",
+        resultContentSource: "network",
         label: "Feishu Wiki",
         description:
           "Feishu knowledge base operations. Actions: spaces, nodes, get, create, move, rename",
@@ -242,12 +243,12 @@ export function registerFeishuWikiTools(api: OpenClawPluginApi) {
               });
             switch (p.action) {
               case "spaces":
-                return jsonToolResult(
+                return jsonResult(
                   await listSpaces(createClient(), readWikiPageSize(p), p.page_token),
                 );
               case "nodes": {
                 const spaceId = requireWikiSpaceId(p.space_id, "space_id");
-                return jsonToolResult(
+                return jsonResult(
                   await listNodes(
                     createClient(),
                     spaceId,
@@ -258,17 +259,17 @@ export function registerFeishuWikiTools(api: OpenClawPluginApi) {
                 );
               }
               case "get":
-                return jsonToolResult(await getNode(createClient(), p.token));
+                return jsonResult(await getNode(createClient(), p.token));
               case "search":
                 optionalWikiSpaceId(p.space_id, "space_id");
                 createClient();
-                return jsonToolResult({
+                return jsonResult({
                   error:
                     "Search is not available. Use feishu_wiki with action: 'nodes' to browse or action: 'get' to lookup by token.",
                 });
               case "create": {
                 const spaceId = requireWikiSpaceId(p.space_id, "space_id");
-                return jsonToolResult(
+                return jsonResult(
                   await createNode(
                     createClient(),
                     spaceId,
@@ -280,7 +281,7 @@ export function registerFeishuWikiTools(api: OpenClawPluginApi) {
               }
               case "move": {
                 const spaceId = requireWikiSpaceId(p.space_id, "space_id");
-                return jsonToolResult(
+                return jsonResult(
                   await moveNode(
                     createClient(),
                     spaceId,
@@ -292,9 +293,7 @@ export function registerFeishuWikiTools(api: OpenClawPluginApi) {
               }
               case "rename": {
                 const spaceId = requireWikiSpaceId(p.space_id, "space_id");
-                return jsonToolResult(
-                  await renameNode(createClient(), spaceId, p.node_token, p.title),
-                );
+                return jsonResult(await renameNode(createClient(), spaceId, p.node_token, p.title));
               }
               default:
                 return unknownToolActionResult((p as { action?: unknown }).action);

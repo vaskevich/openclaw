@@ -3,10 +3,13 @@ import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import {
+  createBoundedResponseTooLargeError,
+  readBoundedResponseText as readBoundedResponseTextWithLimit,
+} from "../../../lib/bounded-response.mjs";
+import {
   assertAgentReplyContainsMarker,
   assertOpenAiRequestLogUsed,
 } from "../agent-turn-output.mjs";
-import { readBoundedResponseText as readBoundedResponseTextWithLimit } from "../bounded-response-text.mjs";
 import {
   applyMockOpenAiModelConfig,
   parseMockOpenAiPort,
@@ -83,7 +86,10 @@ async function readBoundedResponseText(
   byteLimit = clickClackHttpBodyMaxBytes(),
   options = {},
 ) {
-  return await readBoundedResponseTextWithLimit(response, label, byteLimit, options.timeoutPromise);
+  return await readBoundedResponseTextWithLimit(response, label, byteLimit, {
+    createTooLargeError: createBoundedResponseTooLargeError,
+    timeoutPromise: options.timeoutPromise,
+  });
 }
 
 async function readBoundedResponseJson(response, label, options = {}) {
@@ -249,7 +255,7 @@ function configureClickClack() {
           ...cfg.plugins?.entries?.clickclack?.llm,
           allowAgentIdOverride: true,
           allowModelOverride: true,
-          allowedModels: ["openai/gpt-5.5"],
+          allowedModels: ["openai/gpt-5.6-luna"],
         },
       },
     },
@@ -264,7 +270,7 @@ function configureClickClack() {
       workspace: "release",
       defaultTo: "channel:general",
       replyMode: "model",
-      model: "openai/gpt-5.5",
+      model: "openai/gpt-5.6-luna",
       reconnectMs: 250,
     },
   };
@@ -309,7 +315,11 @@ async function waitClickClackSocket() {
     30,
     "ClickClack websocket timeout seconds",
   );
-  const deadline = Date.now() + timeoutSeconds * 1000;
+  await waitForClickClackSocket({ baseUrl, timeoutMs: timeoutSeconds * 1000 });
+}
+
+export async function waitForClickClackSocket({ baseUrl, timeoutMs, pollIntervalMs = 250 }) {
+  const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     const remainingMs = Math.max(1, deadline - Date.now());
     const state = await withClickClackFixtureResponse(
@@ -329,7 +339,7 @@ async function waitClickClackSocket() {
       }
     }
     await new Promise((resolve) => {
-      setTimeout(resolve, 250);
+      setTimeout(resolve, Math.min(pollIntervalMs, Math.max(0, deadline - Date.now())));
     });
   }
   throw new Error(`Timed out waiting for ClickClack websocket connection at ${baseUrl}`);

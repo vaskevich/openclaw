@@ -98,7 +98,9 @@ describe("scripts/plugin-release-pretag-pack-check.ts", () => {
     expect(execFileSyncMock.mock.calls[0]?.slice(0, 2)).toEqual([
       process.execPath,
       [
-        "scripts/check-plugin-npm-runtime-builds.mjs",
+        "--import",
+        "tsx",
+        "scripts/check-plugin-npm-runtime-builds.mts",
         "--package",
         "extensions/demo-plugin",
       ],

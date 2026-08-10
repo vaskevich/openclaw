@@ -21,8 +21,6 @@ export {
   resolveMatrixCredentialsFilename,
   resolveMatrixCredentialsPath,
   resolveMatrixHomeserverKey,
-  resolveMatrixLegacyFlatStoragePaths,
-  resolveMatrixLegacyFlatStoreRoot,
   sanitizeMatrixPathSegment,
 } from "./src/storage-paths.js";
 export {
@@ -35,5 +33,3 @@ export {
   setMatrixThreadBindingMaxAgeBySessionKey,
 } from "./src/matrix/thread-bindings-shared.js";
 export { matrixOnboardingAdapter as matrixSetupWizard } from "./src/onboarding.js";
-
-export const matrixSessionBindingAdapterChannels = ["matrix"] as const;

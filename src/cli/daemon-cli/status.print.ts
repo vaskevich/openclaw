@@ -5,6 +5,7 @@ import {
   resolveGatewayLaunchAgentLabel,
   resolveGatewaySystemdServiceName,
 } from "../../daemon/constants.js";
+import { formatGatewayHeapLimitReport } from "../../daemon/gateway-heap.js";
 import { renderGatewayServiceCleanupHints } from "../../daemon/inspect.js";
 import {
   resolveGatewayRestartLogPath,
@@ -102,6 +103,7 @@ export function printDaemonStatus(status: DaemonStatus, opts: { json: boolean; d
   const spacer = () => defaultRuntime.log("");
 
   const { service, rpc, extraServices } = status;
+  const serviceTargetsProbe = service.targetRole !== "diagnostic-only";
   const serviceStatus = service.loaded
     ? okText(service.loadedText)
     : warnText(service.notLoadedText);
@@ -127,6 +129,11 @@ export function printDaemonStatus(status: DaemonStatus, opts: { json: boolean; d
   const daemonEnvLines = safeDaemonEnv(service.command?.environment);
   if (daemonEnvLines.length > 0) {
     defaultRuntime.log(`${label("Service env:")} ${daemonEnvLines.join(" ")}`);
+  }
+  if (service.gatewayHeap) {
+    defaultRuntime.log(
+      `${label("Gateway heap:")} ${infoText(formatGatewayHeapLimitReport(service.gatewayHeap))}`,
+    );
   }
   spacer();
 
@@ -223,6 +230,12 @@ export function printDaemonStatus(status: DaemonStatus, opts: { json: boolean; d
     if (status.gateway.probeNote) {
       defaultRuntime.log(`${label("Probe note:")} ${infoText(status.gateway.probeNote)}`);
     }
+    if (status.gateway.windowsFirewall?.severity === "warning") {
+      defaultRuntime.error(warnText(`Windows firewall: ${status.gateway.windowsFirewall.message}`));
+      for (const detail of status.gateway.windowsFirewall.details) {
+        defaultRuntime.error(warnText(`  ${detail}`));
+      }
+    }
     spacer();
   }
 
@@ -257,10 +270,37 @@ export function printDaemonStatus(status: DaemonStatus, opts: { json: boolean; d
     defaultRuntime.log(infoText(formatGatewayRestartHandoffDiagnostic(service.restartHandoff)));
   }
 
-  if (rpc && !rpc.ok && service.loaded && service.runtime?.status === "running") {
-    defaultRuntime.log(
-      warnText("Warm-up: launch agents can take a few seconds. Try again shortly."),
-    );
+  if (
+    rpc &&
+    !rpc.ok &&
+    serviceTargetsProbe &&
+    service.loaded &&
+    service.runtime?.status === "running"
+  ) {
+    // The RPC probe failed while the service is loaded and running. Only the case where
+    // the gateway process is up and owns the listening port (health.healthy === true with
+    // no stale gateway PIDs, deep status only) is an unambiguous "not warm-up" signal, so it
+    // gets recovery guidance. `healthy` can also be set from bare reachability after
+    // ownership failed (see restart-health.ts), which can coexist with a non-empty
+    // staleGatewayPids; treat that combination as ambiguous rather than owns-port so it
+    // doesn't contradict the dedicated stale-PID diagnostic below. Every other
+    // health.healthy === false sub-case — a just-started gateway that has not bound the port
+    // yet, a foreign process holding the port, or a stale gateway PID — is either a normal
+    // warm-up window or is already covered by the dedicated stale-PID / port-not-listening /
+    // port-conflict diagnostics below, so it keeps the warm-up hint (as does unknown health
+    // from shallow status). A wedged gateway that owns the port is reported as healthy ===
+    // true with no stale gateway PIDs, so it is steered by the first branch.
+    if (status.health?.healthy === true && status.health.staleGatewayPids.length === 0) {
+      defaultRuntime.log(
+        warnText(
+          "Gateway process is running and owns the gateway port, so this is not a warm-up delay. Check the probe credentials/config, or restart the gateway and inspect its logs if it stays unresponsive.",
+        ),
+      );
+    } else {
+      defaultRuntime.log(
+        warnText("Warm-up: launch agents can take a few seconds. Try again shortly."),
+      );
+    }
   }
   if (rpc) {
     const probeLabel = formatProbeKindLabel(rpc.kind);
@@ -277,6 +317,9 @@ export function printDaemonStatus(status: DaemonStatus, opts: { json: boolean; d
       const lines = (rpc.error ?? "unknown").split(/\r?\n/).filter(Boolean);
       for (const line of lines.slice(0, 12)) {
         defaultRuntime.error(`  ${errorText(line)}`);
+      }
+      if (status.port?.status === "busy" && status.lastError) {
+        defaultRuntime.error(`${errorText("Last gateway error:")} ${status.lastError}`);
       }
     }
     const capability = formatCapabilityLabel(rpc.capability);
@@ -439,10 +482,11 @@ export function printDaemonStatus(status: DaemonStatus, opts: { json: boolean; d
   }
 
   if (
+    serviceTargetsProbe &&
     service.loaded &&
     service.runtime?.status === "running" &&
     status.port &&
-    status.port.status !== "busy"
+    status.port.status === "free"
   ) {
     defaultRuntime.error(
       errorText(`Gateway port ${status.port.port} is not listening (service appears running).`),
@@ -472,7 +516,7 @@ export function printDaemonStatus(status: DaemonStatus, opts: { json: boolean; d
     for (const svc of extraServices) {
       defaultRuntime.log(`- ${warnText(svc.label)} (${svc.scope}, ${svc.detail})`);
     }
-    for (const hint of renderGatewayServiceCleanupHints()) {
+    for (const hint of renderGatewayServiceCleanupHints(extraServices)) {
       defaultRuntime.log(`${infoText("Cleanup hint:")} ${hint}`);
     }
     spacer();

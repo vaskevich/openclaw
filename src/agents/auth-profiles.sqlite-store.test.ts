@@ -9,8 +9,11 @@ import os from "node:os";
 import path from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import * as kyselySync from "../infra/kysely-sync.js";
+import * as nodeSqlite from "../infra/node-sqlite.js";
 import {
   closeOpenClawAgentDatabasesForTest,
+  OPENCLAW_AGENT_SCHEMA_VERSION,
   openOpenClawAgentDatabase,
 } from "../state/openclaw-agent-db.js";
 import { closeOpenClawStateDatabaseForTest } from "../state/openclaw-state-db.js";
@@ -18,10 +21,16 @@ import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths
 import { withEnvAsync } from "../test-utils/env.js";
 import { resolveAgentDir } from "./agent-scope.js";
 import { loadPersistedAuthProfileStore } from "./auth-profiles/persisted.js";
-import { resolveAuthProfileDatabasePath } from "./auth-profiles/sqlite.js";
+import {
+  inspectPersistedAuthProfileStateRaw,
+  inspectPersistedAuthProfileStoreRaw,
+  resolveAuthProfileDatabasePath,
+} from "./auth-profiles/sqlite.js";
 import {
   clearRuntimeAuthProfileStoreSnapshots,
   ensureAuthProfileStore,
+  getRuntimeAuthProfileStoreSnapshotRevision,
+  replaceRuntimeAuthProfileStoreSnapshots,
   saveAuthProfileStore,
 } from "./auth-profiles/store.js";
 import type { AuthProfileStore, OAuthCredential } from "./auth-profiles/types.js";
@@ -72,6 +81,7 @@ async function withAgentDirEnv(prefix: string, run: (agentDir: string) => void |
       async () => await run(agentDir),
     );
   } finally {
+    clearRuntimeAuthProfileStoreSnapshots();
     closeOpenClawAgentDatabasesForTest();
     closeOpenClawStateDatabaseForTest();
     fs.rmSync(root, { recursive: true, force: true });
@@ -121,9 +131,37 @@ describe("auth profile sqlite store", () => {
         "utf8",
       );
 
-      const loaded = ensureAuthProfileStore(agentDir, { syncExternalCli: false });
+      expect(() => ensureAuthProfileStore(agentDir, { syncExternalCli: false })).toThrow(
+        "requires legacy credential migration",
+      );
+    });
+  });
 
-      expect(loaded.profiles["openai:default"]).toBeUndefined();
+  it("fails closed when a credential source appears during a successful SQLite read", async () => {
+    await withAgentDirEnv("openclaw-auth-sqlite-late-legacy-", (agentDir) => {
+      saveAuthProfileStore(apiKeyStore("not-a-real"), agentDir);
+      const legacyPath = path.join(agentDir, "auth.json");
+      const existsSync = fs.existsSync.bind(fs);
+      let legacyChecks = 0;
+      const existsSpy = vi.spyOn(fs, "existsSync").mockImplementation((pathname) => {
+        if (path.resolve(String(pathname)) === path.resolve(legacyPath)) {
+          legacyChecks += 1;
+          if (legacyChecks === 2) {
+            fs.writeFileSync(legacyPath, '{"openai":{"key":"not-a-real"}}\n', "utf8");
+            return true;
+          }
+          return false;
+        }
+        return existsSync(pathname);
+      });
+      try {
+        expect(() => ensureAuthProfileStore(agentDir, { syncExternalCli: false })).toThrow(
+          "requires legacy credential migration",
+        );
+      } finally {
+        existsSpy.mockRestore();
+      }
+      expect(fs.existsSync(legacyPath)).toBe(true);
     });
   });
 
@@ -131,6 +169,66 @@ describe("auth profile sqlite store", () => {
     await withAgentDirEnv("openclaw-auth-sqlite-no-create-", (agentDir) => {
       expect(loadPersistedAuthProfileStore(agentDir)).toBeNull();
       expect(fs.existsSync(path.join(agentDir, "openclaw-agent.sqlite"))).toBe(false);
+    });
+  });
+
+  it("treats a legacy agent database without auth tables as a missing store", async () => {
+    await withAgentDirEnv("openclaw-auth-sqlite-legacy-schema-", (agentDir) => {
+      const database = new DatabaseSync(resolveAuthProfileDatabasePath(agentDir));
+      database.exec("CREATE TABLE legacy_state (id INTEGER PRIMARY KEY);");
+      database.close();
+
+      expect(inspectPersistedAuthProfileStoreRaw(agentDir)).toEqual({
+        status: "missing",
+        reason: "table",
+      });
+    });
+  });
+
+  it("classifies each missing auth table through an existing database handle", async () => {
+    await withAgentDirEnv("openclaw-auth-sqlite-partial-schema-", (agentDir) => {
+      const database = new DatabaseSync(resolveAuthProfileDatabasePath(agentDir));
+      database.exec(`
+        CREATE TABLE auth_profile_store (
+          store_key TEXT NOT NULL PRIMARY KEY,
+          store_json TEXT NOT NULL,
+          updated_at INTEGER NOT NULL
+        );
+      `);
+      try {
+        expect(inspectPersistedAuthProfileStoreRaw(agentDir, { db: database })).toEqual({
+          status: "missing",
+          reason: "row",
+        });
+        expect(inspectPersistedAuthProfileStateRaw(agentDir, { db: database })).toEqual({
+          status: "missing",
+          reason: "table",
+        });
+      } finally {
+        database.close();
+      }
+    });
+  });
+
+  it("rejects a newer agent database that has no current auth table", async () => {
+    await withAgentDirEnv("openclaw-auth-sqlite-newer-schema-", (agentDir) => {
+      const database = new DatabaseSync(resolveAuthProfileDatabasePath(agentDir));
+      database.exec(`PRAGMA user_version = ${OPENCLAW_AGENT_SCHEMA_VERSION + 1};`);
+      database.close();
+
+      expect(inspectPersistedAuthProfileStoreRaw(agentDir)).toEqual({ status: "unreadable" });
+    });
+  });
+
+  it("treats a non-table auth schema object as unreadable", async () => {
+    await withAgentDirEnv("openclaw-auth-sqlite-invalid-schema-", (agentDir) => {
+      const database = new DatabaseSync(resolveAuthProfileDatabasePath(agentDir));
+      database.exec(
+        "CREATE VIEW auth_profile_store AS SELECT 'primary' AS store_key, '{}' AS store_json;",
+      );
+      database.close();
+
+      expect(inspectPersistedAuthProfileStoreRaw(agentDir)).toEqual({ status: "unreadable" });
     });
   });
 
@@ -146,6 +244,87 @@ describe("auth profile sqlite store", () => {
 
       expect(loaded?.profiles["openai:default"]).toMatchObject({ key: "sk-test" });
       expect(fs.existsSync(stateDbPath)).toBe(false);
+    });
+  });
+
+  it("reuses path-keyed read handles until the runtime snapshot revision changes", async () => {
+    await withAgentDirEnv("openclaw-auth-sqlite-read-reuse-", (agentDir) => {
+      const secondaryAgentDir = path.join(
+        path.dirname(path.dirname(agentDir)),
+        "secondary",
+        "agent",
+      );
+      saveAuthProfileStore(apiKeyStore("sk-test"), agentDir);
+      saveAuthProfileStore(apiKeyStore("sk-secondary"), secondaryAgentDir);
+      closeOpenClawAgentDatabasesForTest();
+      clearRuntimeAuthProfileStoreSnapshots();
+      const openSpy = vi.spyOn(nodeSqlite, "openNodeSqliteDatabase");
+      const statementCacheSpy = vi.spyOn(kyselySync, "enableNodeSqliteKyselyStatementCache");
+      try {
+        const initialRevision = getRuntimeAuthProfileStoreSnapshotRevision(agentDir);
+        expect(loadPersistedAuthProfileStore(agentDir)).not.toBeNull();
+        expect(loadPersistedAuthProfileStore(secondaryAgentDir)).not.toBeNull();
+        expect(loadPersistedAuthProfileStore(agentDir)).not.toBeNull();
+        expect(loadPersistedAuthProfileStore(secondaryAgentDir)).not.toBeNull();
+        expect(openSpy.mock.calls.filter(([, options]) => options?.readOnly === true)).toHaveLength(
+          2,
+        );
+        expect(statementCacheSpy).toHaveBeenCalledTimes(2);
+        const firstDatabase = openSpy.mock.results[0]?.value as DatabaseSync | undefined;
+        const secondDatabase = openSpy.mock.results[1]?.value as DatabaseSync | undefined;
+        expect(firstDatabase?.isOpen).toBe(true);
+        expect(secondDatabase?.isOpen).toBe(true);
+
+        replaceRuntimeAuthProfileStoreSnapshots([{ agentDir, store: apiKeyStore("sk-test") }]);
+
+        expect(getRuntimeAuthProfileStoreSnapshotRevision(agentDir)).toBeGreaterThan(
+          initialRevision,
+        );
+        expect(firstDatabase?.isOpen).toBe(false);
+        expect(secondDatabase?.isOpen).toBe(false);
+        expect(loadPersistedAuthProfileStore(agentDir)).not.toBeNull();
+        expect(openSpy.mock.calls.filter(([, options]) => options?.readOnly === true)).toHaveLength(
+          3,
+        );
+        expect(statementCacheSpy).toHaveBeenCalledTimes(3);
+      } finally {
+        statementCacheSpy.mockRestore();
+        openSpy.mockRestore();
+      }
+    });
+  });
+
+  it("reuses the transaction database while filtering multiple inherited OAuth profiles", async () => {
+    await withAgentDirEnv("openclaw-auth-sqlite-save-reuse-", (mainAgentDir) => {
+      const customAgentDir = path.join(path.dirname(path.dirname(mainAgentDir)), "custom", "agent");
+      const profiles = Object.fromEntries(
+        Array.from({ length: 3 }, (_, index) => [
+          `openai:profile-${index}`,
+          {
+            type: "oauth" as const,
+            provider: "openai",
+            access: `access-${index}`,
+            refresh: `refresh-${index}`,
+            expires: Date.now() + 60_000,
+          },
+        ]),
+      );
+      const store: AuthProfileStore = { version: 1, profiles };
+      saveAuthProfileStore(store, mainAgentDir);
+      closeOpenClawAgentDatabasesForTest();
+      const openSpy = vi.spyOn(nodeSqlite, "openNodeSqliteDatabase");
+      try {
+        saveAuthProfileStore(store, customAgentDir);
+        const readOnlyOpens = openSpy.mock.calls.filter(
+          ([, options]) => options?.readOnly === true,
+        );
+        expect(readOnlyOpens).toHaveLength(1);
+        expect(path.resolve(String(readOnlyOpens[0]?.[0]))).toBe(
+          path.resolve(resolveAuthProfileDatabasePath(mainAgentDir)),
+        );
+      } finally {
+        openSpy.mockRestore();
+      }
     });
   });
 

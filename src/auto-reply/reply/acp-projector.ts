@@ -4,6 +4,8 @@ import {
   normalizeOptionalLowercaseString,
   normalizeOptionalString,
 } from "@openclaw/normalization-core/string-coerce";
+import { truncateUtf16Safe, truncateWithMarker } from "@openclaw/normalization-core/utf16-slice";
+import { resolveAcpToolTerminalOutcome } from "../../acp/tool-status.js";
 import { EmbeddedBlockChunker } from "../../agents/embedded-agent-block-chunker.js";
 import { formatToolSummary, resolveToolDisplay } from "../../agents/tool-display.js";
 import type { OpenClawConfig } from "../../config/types.openclaw.js";
@@ -24,7 +26,6 @@ const ACP_LIVE_IDLE_MIN_CHARS = 80;
 const ACP_LIVE_SOFT_FLUSH_CHARS = 220;
 const ACP_LIVE_HARD_FLUSH_CHARS = 480;
 
-const TERMINAL_TOOL_STATUSES = new Set(["completed", "failed", "cancelled", "done", "error"]);
 const HIDDEN_BOUNDARY_TAGS = new Set<AcpSessionUpdateTag>(["tool_call", "tool_call_update"]);
 
 type AcpProjectedDeliveryMeta = {
@@ -50,9 +51,9 @@ function truncateText(input: string, maxChars: number): string {
     return input;
   }
   if (maxChars <= 1) {
-    return input.slice(0, maxChars);
+    return truncateUtf16Safe(input, maxChars);
   }
-  return `${input.slice(0, maxChars - 1)}…`;
+  return truncateWithMarker(input, maxChars, { marker: "…", reserve: 1, trimEnd: false });
 }
 
 function hashText(text: string): string {
@@ -186,15 +187,13 @@ export function createAcpReplyProjector(params: {
     accountId: params.accountId,
     deliveryMode: settings.deliveryMode,
   });
-  const createTurnBlockReplyPipeline = () =>
-    createBlockReplyPipeline({
-      onBlockReply: async (payload) => {
-        await params.deliver("block", payload);
-      },
-      timeoutMs: ACP_BLOCK_REPLY_TIMEOUT_MS,
-      coalescing: settings.deliveryMode === "live" ? undefined : streaming.coalescing,
-    });
-  let blockReplyPipeline = createTurnBlockReplyPipeline();
+  const blockReplyPipeline = createBlockReplyPipeline({
+    onBlockReply: async (payload) => {
+      await params.deliver("block", payload);
+    },
+    timeoutMs: ACP_BLOCK_REPLY_TIMEOUT_MS,
+    coalescing: settings.deliveryMode === "live" ? undefined : streaming.coalescing,
+  });
   const chunker = new EmbeddedBlockChunker(streaming.chunking);
   const liveIdleFlushMs = Math.max(streaming.coalescing.idleMs, ACP_LIVE_IDLE_FLUSH_FLOOR_MS);
 
@@ -266,23 +265,6 @@ export function createAcpReplyProjector(params: {
     }, liveIdleFlushMs);
   };
 
-  const resetTurnState = () => {
-    clearLiveIdleTimer();
-    blockReplyPipeline.stop();
-    blockReplyPipeline = createTurnBlockReplyPipeline();
-    emittedOutputChars = 0;
-    truncationNoticeEmitted = false;
-    lastStatusHash = undefined;
-    lastToolHash = undefined;
-    lastUsageTuple = undefined;
-    lastVisibleOutputTail = undefined;
-    pendingHiddenBoundary = false;
-    liveBufferText = "";
-    finalOnlyOutputText = "";
-    pendingToolDeliveries.length = 0;
-    toolLifecycleById.clear();
-  };
-
   const flushBufferedToolDeliveries = async (force: boolean) => {
     if (!(settings.deliveryMode === "final_only" && force)) {
       return;
@@ -349,7 +331,7 @@ export function createAcpReplyProjector(params: {
       return;
     }
     const status = normalizeToolStatus(event.status);
-    const isTerminal = status ? TERMINAL_TOOL_STATUSES.has(status) : false;
+    const isTerminal = resolveAcpToolTerminalOutcome(status) !== undefined;
     pendingHiddenBoundary = pendingHiddenBoundary || event.tag === "tool_call" || isTerminal;
   };
 
@@ -367,7 +349,7 @@ export function createAcpReplyProjector(params: {
     const hash = hashText(renderedToolSummary);
     const toolCallId = normalizeOptionalString(event.toolCallId);
     const status = normalizeToolStatus(event.status);
-    const isTerminal = status ? TERMINAL_TOOL_STATUSES.has(status) : false;
+    const isTerminal = resolveAcpToolTerminalOutcome(status) !== undefined;
     const isStart = status === "in_progress" || event.tag === "tool_call";
 
     if (settings.repeatSuppression) {
@@ -433,6 +415,7 @@ export function createAcpReplyProjector(params: {
     );
   };
 
+  // One projector serves one dispatch; terminal settlement belongs to tryDispatchAcpReply.
   const onEvent = async (event: AcpRuntimeEvent): Promise<void> => {
     params.onProgress?.();
     if (event.type === "text_delta") {
@@ -462,7 +445,7 @@ export function createAcpReplyProjector(params: {
         return;
       }
       const remaining = settings.maxOutputChars - emittedOutputChars;
-      const accepted = remaining < text.length ? text.slice(0, remaining) : text;
+      const accepted = remaining < text.length ? truncateUtf16Safe(text, remaining) : text;
       if (accepted.length > 0) {
         emittedOutputChars += accepted.length;
         lastVisibleOutputTail = accepted.slice(-1);
@@ -479,6 +462,9 @@ export function createAcpReplyProjector(params: {
         }
       }
       if (accepted.length < text.length) {
+        // A split code point can leave the accepted prefix shorter than the remaining budget.
+        // Exhaust it after any drop so later deltas cannot skip past omitted text.
+        emittedOutputChars = settings.maxOutputChars;
         await emitTruncationNotice();
       }
       return;
@@ -510,12 +496,6 @@ export function createAcpReplyProjector(params: {
         return;
       }
       await emitToolSummary(event);
-      return;
-    }
-
-    if (event.type === "done" || event.type === "error") {
-      await flush(true);
-      resetTurnState();
     }
   };
 

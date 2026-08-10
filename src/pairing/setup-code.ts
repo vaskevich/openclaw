@@ -17,51 +17,67 @@ import type { OpenClawConfig } from "../config/types.js";
 import { normalizeSecretInputString, resolveSecretInputRef } from "../config/types.secrets.js";
 import { materializeGatewayAuthSecretRefs } from "../gateway/auth-config-utils.js";
 import { assertExplicitGatewayAuthModeWhenBothConfigured } from "../gateway/auth-mode-policy.js";
+import { normalizeWebSocketProtocol } from "../gateway/websocket-protocol.js";
 import { resolveAdvertisedLanHost } from "../infra/advertised-lan-host.js";
 import { issueDeviceBootstrapToken } from "../infra/device-bootstrap.js";
 import {
   pickMatchingExternalInterfaceAddress,
   safeNetworkInterfaces,
 } from "../infra/network-interfaces.js";
-import { PAIRING_SETUP_BOOTSTRAP_PROFILE } from "../shared/device-bootstrap-profile.js";
+import {
+  deviceBootstrapProfilesEqual,
+  FULL_ACCESS_PAIRING_SETUP_BOOTSTRAP_PROFILE,
+  NODE_PAIRING_SETUP_BOOTSTRAP_PROFILE,
+  PAIRING_SETUP_BOOTSTRAP_PROFILE,
+  type DeviceBootstrapProfileInput,
+} from "../shared/device-bootstrap-profile.js";
 import { resolveGatewayBindUrl } from "../shared/gateway-bind-url.js";
 import {
   resolveTailnetHostWithRunner,
+  resolveTailscaleServeGatewayUrlsWithRunner,
   resolveTailscalePublishedHost,
 } from "../shared/tailscale-status.js";
 
-export type PairingSetupPayload = {
+type PairingSetupPayload = {
   url: string;
+  urls?: string[];
   bootstrapToken: string;
 };
 
-export type PairingSetupCommandResult = {
+type PairingSetupAccess = "full" | "limited" | "node";
+
+const PAIRING_SETUP_MAX_URLS = 8;
+
+type PairingSetupCommandResult = {
   code: number | null;
   stdout: string;
   stderr?: string;
 };
 
-export type PairingSetupCommandRunner = (
+type PairingSetupCommandRunner = (
   argv: string[],
   opts: { timeoutMs: number; maxOutputBytes?: number },
 ) => Promise<PairingSetupCommandResult>;
 
-export type ResolvePairingSetupOptions = {
+type ResolvePairingSetupOptions = {
   env?: NodeJS.ProcessEnv;
   publicUrl?: string;
   preferRemoteUrl?: boolean;
   forceSecure?: boolean;
+  bootstrapProfile?: DeviceBootstrapProfileInput;
   pairingBaseDir?: string;
   runCommandWithTimeout?: PairingSetupCommandRunner;
   networkInterfaces?: () => ReturnType<typeof os.networkInterfaces>;
 };
 
-export type PairingSetupResolution =
+type PairingSetupResolution =
   | {
       ok: true;
       payload: PairingSetupPayload;
       authLabel: "token" | "password";
       urlSource: string;
+      access: PairingSetupAccess;
+      accessDowngraded: boolean;
     }
   | {
       ok: false;
@@ -137,6 +153,29 @@ function isMobilePairingCleartextAllowedHost(host: string): boolean {
   );
 }
 
+function isFullAccessMobilePairingUrl(url: string): boolean {
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol === "wss:") {
+      return true;
+    }
+    const host = normalizeMobilePairingHost(parsed.hostname);
+    return parsed.protocol === "ws:" && (host === "localhost" || isLoopbackIpAddress(host));
+  } catch {
+    return false;
+  }
+}
+
+function resolvePairingSetupAccess(profile: DeviceBootstrapProfileInput): PairingSetupAccess {
+  if (deviceBootstrapProfilesEqual(profile, FULL_ACCESS_PAIRING_SETUP_BOOTSTRAP_PROFILE)) {
+    return "full";
+  }
+  if (deviceBootstrapProfilesEqual(profile, NODE_PAIRING_SETUP_BOOTSTRAP_PROFILE)) {
+    return "node";
+  }
+  return "limited";
+}
+
 function validateMobilePairingUrl(url: string, source?: string): string | null {
   let parsed: URL;
   try {
@@ -144,8 +183,7 @@ function validateMobilePairingUrl(url: string, source?: string): string | null {
   } catch {
     return "Resolved mobile pairing URL is invalid.";
   }
-  const protocol =
-    parsed.protocol === "https:" ? "wss:" : parsed.protocol === "http:" ? "ws:" : parsed.protocol;
+  const protocol = normalizeWebSocketProtocol(parsed.protocol);
   if (protocol === "wss:") {
     return null;
   }
@@ -188,11 +226,11 @@ function parseNormalizedGatewayUrl(raw: string): string | null {
     if (parsed.username || parsed.password) {
       return null;
     }
-    const scheme = parsed.protocol.replace(":", "");
-    if (!scheme) {
+    const protocol = normalizeWebSocketProtocol(parsed.protocol);
+    if (!protocol) {
       return null;
     }
-    const resolvedScheme = scheme === "http" ? "ws" : scheme === "https" ? "wss" : scheme;
+    const resolvedScheme = protocol.replace(":", "");
     if (resolvedScheme !== "ws" && resolvedScheme !== "wss") {
       return null;
     }
@@ -381,8 +419,10 @@ export async function resolvePairingSetupFromConfig(
     cfg,
     env,
     mode: cfg.gateway?.auth?.mode,
-    hasTokenCandidate: Boolean(normalizeOptionalString(env.OPENCLAW_GATEWAY_TOKEN)),
-    hasPasswordCandidate: Boolean(normalizeOptionalString(env.OPENCLAW_GATEWAY_PASSWORD)),
+    hasTokenOverride: false,
+    hasPasswordOverride: false,
+    hasTokenFallback: Boolean(normalizeOptionalString(env.OPENCLAW_GATEWAY_TOKEN)),
+    hasPasswordFallback: Boolean(normalizeOptionalString(env.OPENCLAW_GATEWAY_PASSWORD)),
   });
   const authLabel = resolvePairingSetupAuthLabel(cfgForAuth, env);
   if (authLabel.error) {
@@ -409,18 +449,48 @@ export async function resolvePairingSetupFromConfig(
     return { ok: false, error: "Gateway auth is not configured (no token or password)." };
   }
 
+  const urls = [urlResult.url];
+  if (urlResult.source === "gateway.bind=lan") {
+    const serveUrls = await resolveTailscaleServeGatewayUrlsWithRunner(
+      resolveGatewayPort(cfgForAuth, env),
+      options.runCommandWithTimeout,
+    );
+    for (const serveUrl of serveUrls) {
+      if (!validateMobilePairingUrl(serveUrl, "tailscale serve status")) {
+        urls.push(serveUrl);
+      }
+    }
+  }
+  const uniqueUrls = [...new Set(urls)].slice(0, PAIRING_SETUP_MAX_URLS);
+  const requestedBootstrapProfile =
+    options.bootstrapProfile ?? FULL_ACCESS_PAIRING_SETUP_BOOTSTRAP_PROFILE;
+  const accessDowngraded =
+    deviceBootstrapProfilesEqual(
+      requestedBootstrapProfile,
+      FULL_ACCESS_PAIRING_SETUP_BOOTSTRAP_PROFILE,
+    ) && uniqueUrls.some((url) => !isFullAccessMobilePairingUrl(url));
+  // Every advertised URL shares this bearer token. Keep plaintext LAN routes
+  // useful for node/chat access, but reserve admin handoff for an all-TLS
+  // route set (or same-host loopback, where no LAN observer exists).
+  const issuedBootstrapProfile = accessDowngraded
+    ? PAIRING_SETUP_BOOTSTRAP_PROFILE
+    : requestedBootstrapProfile;
+
   return {
     ok: true,
     payload: {
       url: urlResult.url,
+      ...(uniqueUrls.length > 1 ? { urls: uniqueUrls } : {}),
       bootstrapToken: (
         await issueDeviceBootstrapToken({
           baseDir: options.pairingBaseDir,
-          profile: PAIRING_SETUP_BOOTSTRAP_PROFILE,
+          profile: issuedBootstrapProfile,
         })
       ).token,
     },
     authLabel: authLabel.label,
     urlSource: urlResult.source ?? "unknown",
+    access: resolvePairingSetupAccess(issuedBootstrapProfile),
+    accessDowngraded,
   };
 }
