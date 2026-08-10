@@ -43,3 +43,33 @@ describe("gateway trusted-proxy device auto-approval config", () => {
     },
   );
 });
+
+describe("gateway identity scope grants config", () => {
+  test("accepts the closed operator scope set", () => {
+    const result = OpenClawSchema.safeParse({
+      gateway: {
+        auth: {
+          identityScopes: {
+            "admin@example.com": ["operator.admin", "operator.read"],
+          },
+        },
+      },
+    });
+
+    expect(result.success).toBe(true);
+  });
+
+  test("rejects unknown operator scopes", () => {
+    const result = OpenClawSchema.safeParse({
+      gateway: {
+        auth: {
+          identityScopes: {
+            "admin@example.com": ["operator.superuser"],
+          },
+        },
+      },
+    });
+
+    expect(result.success).toBe(false);
+  });
+});

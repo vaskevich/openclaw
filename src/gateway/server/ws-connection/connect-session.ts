@@ -18,6 +18,7 @@ import { upsertPresence } from "../../../infra/system-presence.js";
 import { loadVoiceWakeRoutingConfig } from "../../../infra/voicewake-routing.js";
 import { loadVoiceWakeConfig } from "../../../infra/voicewake.js";
 import { resolveLocalNodeId } from "../../../node-host/local-id.js";
+import { roleScopesAllow } from "../../../shared/operator-scope-compat.js";
 import { recordRemoteNodeInfo, refreshRemoteNodeBins } from "../../../skills/runtime/remote.js";
 import { classifyTailscaleLogin } from "../../../state/user-profiles-tailscale-login.js";
 import {
@@ -50,6 +51,7 @@ import { truncateCloseReason } from "../close-reason.js";
 import { incrementPresenceVersion } from "../health-state.js";
 import { broadcastPresenceSnapshot } from "../presence-events.js";
 import type { GatewayWsClient } from "../ws-types.js";
+import { applyConnectionScopeCap } from "./connect-admission.js";
 import { sendGatewayHello } from "./connect-hello.js";
 import { prepareGatewayNodeConnect } from "./connect-node-session.js";
 import type {
@@ -75,6 +77,41 @@ function setSocketMaxPayload(socket: WebSocket, maxPayload: number): void {
   if (receiver) {
     receiver["_maxPayload"] = maxPayload;
   }
+}
+
+function resolveEffectiveConnectionScopes(params: {
+  role: string;
+  deviceScopes: string[];
+  verifiedIdentity?: string;
+  identityScopes?: Record<string, string[]>;
+  upgradeReq: GatewayConnectPhaseContext["handler"]["upgradeReq"];
+}): { scopes: string[]; addedIdentityScopes: string[] } {
+  const verifiedIdentity = params.verifiedIdentity;
+  const exactIdentityScopes = verifiedIdentity
+    ? params.identityScopes?.[verifiedIdentity]
+    : undefined;
+  const normalizedEmailEntry = verifiedIdentity?.includes("@")
+    ? Object.entries(params.identityScopes ?? {}).find(([identity]) =>
+        identity.includes("@") ? identity.toLowerCase() === verifiedIdentity.toLowerCase() : false,
+      )
+    : undefined;
+  const identityScopes =
+    params.role === "operator" ? (exactIdentityScopes ?? normalizedEmailEntry?.[1] ?? []) : [];
+  const union =
+    identityScopes.length > 0
+      ? [...new Set([...params.deviceScopes, ...identityScopes])]
+      : params.deviceScopes;
+  const scopes = applyConnectionScopeCap({ scopes: union, upgradeReq: params.upgradeReq });
+  const addedIdentityScopes = identityScopes.filter(
+    (scope) =>
+      scopes.includes(scope) &&
+      !roleScopesAllow({
+        role: "operator",
+        requestedScopes: [scope],
+        allowedScopes: params.deviceScopes,
+      }),
+  );
+  return { scopes, addedIdentityScopes };
 }
 
 export async function attachAuthenticatedGatewayConnect(
@@ -115,7 +152,6 @@ export async function attachAuthenticatedGatewayConnect(
     maxProtocol,
     usesLegacyNodeProtocol,
     role,
-    scopes,
     device,
     devicePublicKey,
     deviceToken,
@@ -217,6 +253,23 @@ export async function attachAuthenticatedGatewayConnect(
         `user profile resolution failed conn=${connId} user=${formatForLog(authenticatedUserId)}: ${formatForLog(error)}`,
       );
     }
+  }
+  // Unbound-scope clearing guards self-declared claims, not server-side identity grants.
+  // Apply those grants only after the verified identity has resolved.
+  const effectiveScopes = resolveEffectiveConnectionScopes({
+    role,
+    deviceScopes: state.scopes,
+    verifiedIdentity: authenticatedUserId,
+    identityScopes: context.configSnapshot.gateway?.auth?.identityScopes,
+    upgradeReq: context.handler.upgradeReq,
+  });
+  const scopes = effectiveScopes.scopes;
+  state.scopes = scopes;
+  connectParams.scopes = scopes;
+  if (authenticatedUserId && effectiveScopes.addedIdentityScopes.length > 0) {
+    logGateway.warn(
+      `security audit: identity scope grant elevated connection identity=${formatForLog(authenticatedUserId)} addedScopes=${effectiveScopes.addedIdentityScopes.join(",")} conn=${connId}`,
+    );
   }
   const pluginSurfaceUrls: Record<string, string> = {};
   const pluginNodeCapabilitySurfaces = indexPluginNodeCapabilitySurfaces(pluginNodeCapabilities);

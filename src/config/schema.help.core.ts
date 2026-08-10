@@ -107,6 +107,8 @@ export const CORE_FIELD_HELP: Record<string, string> = {
     'Gateway auth mode: "none", "token", "password", or "trusted-proxy" depending on your edge architecture. Use token/password for direct exposure, and trusted-proxy only behind hardened identity-aware proxies.',
   "gateway.auth.allowTailscale":
     "Allows trusted Tailscale identity paths to satisfy gateway auth checks when configured. Use this only when your tailnet identity posture is strong and operator workflows depend on it.",
+  "gateway.auth.identityScopes":
+    "Maps verified trusted-proxy or Tailscale user identities to server-granted operator scopes. Grants are added to device scopes for that connection, then narrowed by an explicit x-openclaw-scopes header when present. Email identity matching is case-insensitive.",
   "gateway.auth.rateLimit":
     "Login/auth attempt throttling controls to reduce credential brute-force risk at the gateway boundary. Keep enabled in exposed environments and tune thresholds to your traffic baseline.",
   "gateway.auth.trustedProxy":

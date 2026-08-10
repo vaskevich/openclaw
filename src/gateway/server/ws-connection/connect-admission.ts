@@ -32,14 +32,14 @@ import { truncateCloseReason } from "../close-reason.js";
 import { isNativeAppUiClient } from "./handshake-auth-helpers.js";
 import type { GatewayConnectPhaseContext } from "./message-handler-types.js";
 
-export function resolveTrustedProxyControlUiScopes(params: {
-  requestedScopes: string[];
+export function applyConnectionScopeCap(params: {
+  scopes: string[];
   upgradeReq: IncomingMessage;
 }): string[] {
   const header = params.upgradeReq.headers["x-openclaw-scopes"];
   const rawHeader = Array.isArray(header) ? header[0] : header;
   if (rawHeader === undefined) {
-    return params.requestedScopes;
+    return params.scopes;
   }
   const declaredScopes = new Set(
     rawHeader
@@ -49,7 +49,7 @@ export function resolveTrustedProxyControlUiScopes(params: {
   );
   return declaredScopes.size === 0
     ? []
-    : params.requestedScopes.filter((scope) => declaredScopes.has(scope));
+    : params.scopes.filter((scope) => declaredScopes.has(scope));
 }
 
 export async function admitGatewayConnect(context: GatewayConnectPhaseContext) {
