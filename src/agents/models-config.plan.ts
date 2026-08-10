@@ -7,7 +7,8 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
 import type { PreparedProviderStaticCatalog } from "../plugins/provider-discovery.js";
 import { isRecord } from "../utils.js";
-import { ensureAuthProfileStore } from "./auth-profiles/store.js";
+import { loadPersistedAuthProfileStore } from "./auth-profiles/persisted.js";
+import { getRuntimeAuthProfileStoreSnapshot } from "./auth-profiles/runtime-snapshots.js";
 import type { AuthProfileStore } from "./auth-profiles/types.js";
 import { isNonSecretApiKeyMarker } from "./model-auth-markers.js";
 import {
@@ -237,17 +238,24 @@ function replacePlaintextProviderApiKeysWithProfileIds(params: {
   agentDir: string;
   env: NodeJS.ProcessEnv;
   providers: Record<string, ProviderConfig>;
+  secretRefManagedProviders: ReadonlySet<string>;
 }): Record<string, ProviderConfig> {
   let store: AuthProfileStore | undefined;
   let mutated = false;
   const providers: Record<string, ProviderConfig> = {};
   for (const [providerId, provider] of Object.entries(params.providers)) {
     const apiKey = typeof provider.apiKey === "string" ? provider.apiKey.trim() : "";
-    if (!apiKey || isNonSecretApiKeyMarker(apiKey) || Object.hasOwn(params.env, apiKey)) {
+    if (
+      !apiKey ||
+      isNonSecretApiKeyMarker(apiKey) ||
+      Object.hasOwn(params.env, apiKey) ||
+      params.secretRefManagedProviders.has(providerId)
+    ) {
       providers[providerId] = provider;
       continue;
     }
-    store ??= ensureAuthProfileStore(params.agentDir, { allowKeychainPrompt: false });
+    store ??= getRuntimeAuthProfileStoreSnapshot(params.agentDir) ??
+      loadPersistedAuthProfileStore(params.agentDir) ?? { version: 1, profiles: {} };
     const profileId = resolvePersistedProfileId({ apiKey, provider: providerId, store });
     if (!profileId) {
       throw new Error(
@@ -368,6 +376,7 @@ async function planOpenClawModelsJsonWithDeps(
     agentDir,
     env,
     providers: applyNativeStreamingUsageCompat(filterWritableProviders(secretEnforcedProviders)),
+    secretRefManagedProviders,
   });
   const splitProviders = splitProvidersByPluginOwner({
     providers: finalProviders,

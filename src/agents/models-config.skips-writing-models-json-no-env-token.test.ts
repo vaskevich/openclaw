@@ -5,6 +5,8 @@ import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vite
 import type { PluginMetadataSnapshot } from "../plugins/plugin-metadata-snapshot.js";
 import { captureEnv, setTestEnvValue } from "../test-utils/env.js";
 import { resolveDefaultAgentDir } from "./agent-scope.js";
+import { loadPersistedAuthProfileStore } from "./auth-profiles/persisted.js";
+import { saveAuthProfileStore } from "./auth-profiles/store.js";
 import {
   CUSTOM_PROXY_MODELS_CONFIG,
   installModelsConfigTestHooks,
@@ -207,6 +209,19 @@ describe("models-config", () => {
 
   it("writes models.json for configured providers", async () => {
     await withTempHome(async () => {
+      saveAuthProfileStore(
+        {
+          version: 1,
+          profiles: {
+            "custom-proxy:config": {
+              type: "api_key",
+              provider: "custom-proxy",
+              key: "TEST_KEY",
+            },
+          },
+        },
+        resolveDefaultAgentDir({}),
+      );
       await ensureOpenClawModelsJson(CUSTOM_PROXY_MODELS_CONFIG);
 
       const modelPath = path.join(resolveDefaultAgentDir({}), "models.json");
@@ -231,11 +246,24 @@ describe("models-config", () => {
     });
   });
 
-  it("preserves existing generated plugin catalog secrets in merge mode", async () => {
+  it("preserves plugin catalog metadata after moving auth to the credential store", async () => {
     await withTempHome(async (home) => {
       const agentDir = path.join(home, "agent-plugin-merge");
       await fs.mkdir(agentDir, { recursive: true });
       await fs.writeFile(path.join(agentDir, "models.json"), JSON.stringify({ providers: {} }));
+      saveAuthProfileStore(
+        {
+          version: 1,
+          profiles: {
+            "deepseek:models-json": {
+              type: "api_key",
+              provider: "deepseek",
+              key: "persisted-key",
+            },
+          },
+        },
+        agentDir,
+      );
       replacePersistedPluginModelCatalogs({
         agentDir,
         pluginCatalogWrites: {
@@ -279,6 +307,10 @@ describe("models-config", () => {
         providers: Record<string, ParsedProviderConfig>;
       };
       expect(parsed.providers.deepseek?.baseUrl).toBe("https://persisted.example/v1");
+      expect(parsed.providers.deepseek?.apiKey).toBe("DEEPSEEK_API_KEY");
+      expect(
+        loadPersistedAuthProfileStore(agentDir)?.profiles["deepseek:models-json"],
+      ).toMatchObject({ key: "persisted-key" });
       expect(parsed.providers.deepseek).toBeDefined();
     });
   });

@@ -28,10 +28,20 @@ function createAgentDir(): string {
 
 function provider(apiKey: string) {
   return {
-    api: "openai-responses" as const,
+    api: "openai-completions" as const,
     apiKey,
     baseUrl: "https://models.example/v1",
-    models: [{ id: "example-model", name: "Example model" }],
+    models: [
+      {
+        id: "example-model",
+        name: "Example model",
+        reasoning: false,
+        input: ["text" as const],
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 128_000,
+        maxTokens: 16_384,
+      },
+    ],
   };
 }
 
@@ -95,7 +105,7 @@ describe("doctor model catalog credential migration", () => {
     const root = JSON.parse(fs.readFileSync(path.join(agentDir, "models.json"), "utf8")) as {
       providers: Record<string, { apiKey?: string }>;
     };
-    expect(root.providers.root.apiKey).toBe("root:default");
+    expect(root.providers.root?.apiKey).toBe("root:default");
     const pluginCatalog = loadPersistedPluginModelCatalogsReadOnly(agentDir)[0];
     const plugin = JSON.parse(pluginCatalog?.contents ?? "{}") as {
       providers?: Record<string, { apiKey?: string }>;
