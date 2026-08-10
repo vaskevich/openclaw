@@ -62,3 +62,4 @@ export {
   sliceUtf16Safe,
   truncateUtf16Safe,
 } from "../utils.js";
+export { resolveEffectiveHomeDir as resolveHomeDir } from "../infra/home-dir.js";
