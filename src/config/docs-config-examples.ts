@@ -2,7 +2,11 @@ import fs from "node:fs";
 import path from "node:path";
 import { isRecord } from "@openclaw/normalization-core/record-coerce";
 import JSON5 from "json5";
-import { validateConfigObjectRaw } from "./validation-core.js";
+import {
+  loadPluginMetadataSnapshot,
+  type PluginMetadataSnapshot,
+} from "../plugins/plugin-metadata-snapshot.js";
+import { validateConfigObjectRawWithPlugins } from "./validation.js";
 import { OpenClawSchemaShape } from "./zod-schema.root-shape.js";
 
 type DocsConfigFinding = {
@@ -33,6 +37,11 @@ type MarkdownFence = {
   info: string;
   body: string;
   startLine: number;
+};
+
+type DocsConfigValidationContext = {
+  env: NodeJS.ProcessEnv;
+  pluginMetadataSnapshot: Pick<PluginMetadataSnapshot, "manifestRegistry">;
 };
 
 const ROOT_CONFIG_KEYS = new Set(Object.keys(OpenClawSchemaShape));
@@ -112,7 +121,26 @@ function stripIncludeKeys(value: unknown): unknown {
   );
 }
 
-function auditConfigMarkdown(params: { markdown: string; filePath: string }): DocsConfigAudit {
+function createDocsConfigValidationContext(): DocsConfigValidationContext {
+  const env = {
+    ...process.env,
+    OPENCLAW_BUNDLED_PLUGINS_DIR: path.join(process.cwd(), "extensions"),
+  };
+  return {
+    env,
+    pluginMetadataSnapshot: loadPluginMetadataSnapshot({
+      config: {},
+      env,
+      preferPersisted: false,
+      allowCurrent: false,
+    }),
+  };
+}
+
+function auditConfigMarkdown(
+  params: { markdown: string; filePath: string },
+  validationContext: DocsConfigValidationContext,
+): DocsConfigAudit {
   const findings: DocsConfigFinding[] = [];
   const stats = emptyStats(1);
 
@@ -148,7 +176,8 @@ function auditConfigMarkdown(params: { markdown: string; filePath: string }): Do
       continue;
     }
 
-    const result = validateConfigObjectRaw(stripIncludeKeys(parsed), {
+    const result = validateConfigObjectRawWithPlugins(stripIncludeKeys(parsed), {
+      ...validationContext,
       validateBundledChannels: true,
     });
     stats.candidatesValidated += 1;
@@ -210,6 +239,7 @@ export function auditDocsConfigExamples(params: { repoRoot: string }): DocsConfi
   const docsRoot = path.join(params.repoRoot, "docs");
   const findings: DocsConfigFinding[] = [];
   const stats = emptyStats();
+  const validationContext = createDocsConfigValidationContext();
 
   for (const filePath of listDocsFiles(docsRoot)) {
     const docsRelativePath = path.relative(docsRoot, filePath).split(path.sep).join("/");
@@ -217,10 +247,13 @@ export function auditDocsConfigExamples(params: { repoRoot: string }): DocsConfi
       continue;
     }
     const repoRelativePath = path.posix.join("docs", docsRelativePath);
-    const audit = auditConfigMarkdown({
-      markdown: fs.readFileSync(filePath, "utf8"),
-      filePath: repoRelativePath,
-    });
+    const audit = auditConfigMarkdown(
+      {
+        markdown: fs.readFileSync(filePath, "utf8"),
+        filePath: repoRelativePath,
+      },
+      validationContext,
+    );
     findings.push(...audit.findings);
     for (const [key, value] of Object.entries(audit.stats)) {
       stats[key as keyof DocsConfigStats] += value;

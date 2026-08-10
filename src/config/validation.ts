@@ -57,6 +57,7 @@ type ValidateConfigWithPluginsParams = {
   ) => Pick<PluginMetadataSnapshot, "manifestRegistry">;
   sourceRaw?: unknown;
   preservedLegacyRootKeys?: readonly string[];
+  validateBundledChannels?: boolean;
 };
 
 type RegistryInfo = {
@@ -81,6 +82,7 @@ export function validateConfigObjectWithPlugins(
     loadPluginMetadataSnapshot: params?.loadPluginMetadataSnapshot,
     sourceRaw: params?.sourceRaw,
     preservedLegacyRootKeys: params?.preservedLegacyRootKeys,
+    validateBundledChannels: params?.validateBundledChannels,
   });
 }
 
@@ -97,6 +99,7 @@ export function validateConfigObjectRawWithPlugins(
     loadPluginMetadataSnapshot: params?.loadPluginMetadataSnapshot,
     sourceRaw: params?.sourceRaw,
     preservedLegacyRootKeys: params?.preservedLegacyRootKeys,
+    validateBundledChannels: params?.validateBundledChannels,
   });
 }
 
@@ -108,6 +111,7 @@ function validateConfigObjectWithPluginsBase(
     sourceRaw: opts.sourceRaw,
     preservedLegacyRootKeys: opts.preservedLegacyRootKeys,
     env: opts.env,
+    validateBundledChannels: opts.validateBundledChannels,
   });
   if (!base.ok) {
     return { ok: false, issues: base.issues, warnings: [] };
