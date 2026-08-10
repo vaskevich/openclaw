@@ -4,6 +4,7 @@ import { randomUUID } from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { resolveRequiredOsHomeDir } from "../infra/home-dir.js";
 import { normalizeEnvVarKey } from "../infra/host-env-security.js";
 import { parseStrictInteger, parseStrictPositiveInteger } from "../infra/parse-finite-number.js";
 import { formatPortDiagnostics } from "../infra/ports-format.js";
@@ -45,7 +46,7 @@ import {
   isSystemLaunchDaemonOwnershipError,
 } from "./launchd-system.js";
 import { formatLine, toPosixPath, writeFormattedLines } from "./output.js";
-import { resolveGatewayStateDir, resolveHomeDir } from "./paths.js";
+import { resolveGatewayStateDir } from "./paths.js";
 import { resolveGatewaySupervisorLogPaths } from "./restart-logs.js";
 import { parseKeyValueOutput } from "./runtime-parse.js";
 import { createGatewayLifecycleMutationReporter } from "./service-mutation.js";
@@ -167,7 +168,7 @@ function resolveLaunchAgentPlistPathForLabel(
   env: Record<string, string | undefined>,
   label: string,
 ): string {
-  const home = toPosixPath(resolveHomeDir(env));
+  const home = toPosixPath(resolveRequiredOsHomeDir(env));
   return path.posix.join(home, "Library", "LaunchAgents", `${label}.plist`);
 }
 
@@ -1025,7 +1026,7 @@ export async function uninstallLaunchAgent({
     return;
   }
 
-  const home = toPosixPath(resolveHomeDir(env));
+  const home = toPosixPath(resolveRequiredOsHomeDir(env));
   const trashDir = path.posix.join(home, ".Trash");
   const dest = path.join(trashDir, `${label}.plist`);
   try {
@@ -1338,7 +1339,7 @@ async function writeLaunchAgentPlist({
   await ensureSecureDirectory(logDir);
 
   const plistPath = resolveLaunchAgentPlistPathForLabel(env, label);
-  const home = toPosixPath(resolveHomeDir(env));
+  const home = toPosixPath(resolveRequiredOsHomeDir(env));
   const libraryDir = path.posix.join(home, "Library");
   await ensureSecureDirectory(home);
   await ensureSecureDirectory(libraryDir);

@@ -54,7 +54,6 @@ export {
   normalizeE164,
   pathExists,
   resolveConfigDir,
-  resolveHomeDir,
   resolveUserPath,
   safeParseJson,
   shortenHomeInString,

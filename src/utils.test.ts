@@ -12,7 +12,6 @@ import {
   normalizeE164,
   pinConfigDir,
   resolveConfigDir,
-  resolveHomeDir,
   resolveUserPath,
   shortenHomeInString,
   shortenHomePath,
@@ -178,14 +177,6 @@ describe("resolveConfigDir", () => {
         OPENCLAW_TEST_FAST: "1",
       });
     }
-  });
-});
-
-describe("resolveHomeDir", () => {
-  it("prefers OPENCLAW_HOME over HOME", () => {
-    withEnv({ OPENCLAW_HOME: "/srv/openclaw-home", HOME: "/home/other" }, () => {
-      expect(resolveHomeDir()).toBe(path.resolve("/srv/openclaw-home"));
-    });
   });
 });
 

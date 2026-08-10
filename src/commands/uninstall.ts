@@ -16,8 +16,9 @@ import { formatCliCommand } from "../cli/command-format.js";
 import { isNixMode } from "../config/config.js";
 import { resolveGatewayService } from "../daemon/service.js";
 import { formatErrorMessage } from "../infra/errors.js";
+import { resolveEffectiveHomeDir } from "../infra/home-dir.js";
 import type { RuntimeEnv } from "../runtime.js";
-import { resolveHomeDir, shortenHomeInString } from "../utils.js";
+import { shortenHomeInString } from "../utils.js";
 import { resolveCleanupPlanFromDisk } from "./cleanup-plan.js";
 import { removePath, removeStateAndLinkedPaths, removeWorkspaceDirs } from "./cleanup-utils.js";
 
@@ -236,7 +237,7 @@ export async function uninstallCommand(runtime: RuntimeEnv, opts: UninstallOptio
   runtime.log("CLI still installed. Remove via npm/pnpm if desired.");
 
   if (scopes.has("state") && !scopes.has("workspace")) {
-    const home = resolveHomeDir();
+    const home = resolveEffectiveHomeDir();
     if (home && workspaceDirs.some((dir) => dir.startsWith(path.resolve(home)))) {
       runtime.log("Tip: workspaces were preserved. Re-run with --workspace to remove them.");
     }

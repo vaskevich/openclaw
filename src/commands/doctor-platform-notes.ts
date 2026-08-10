@@ -1,6 +1,5 @@
 /** Platform-specific doctor notes for macOS gateway launchd state and startup tuning. */
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { normalizeOptionalString } from "@openclaw/normalization-core/string-coerce";
 import { note } from "../../packages/terminal-core/src/note.js";
@@ -9,14 +8,11 @@ import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { hasConfiguredSecretInput } from "../config/types.secrets.js";
 import { findStaleOpenClawUpdateLaunchdJobs } from "../daemon/launchd.js";
 import { resolveGatewayService, type GatewayService } from "../daemon/service.js";
+import { resolveRequiredOsHomeDir } from "../infra/home-dir.js";
 import { runExec } from "../process/exec.js";
 import { shortenHomePath } from "../utils.js";
 
 const DOCTOR_LAUNCHCTL_TIMEOUT_MS = 5_000;
-
-function resolveHomeDir(): string {
-  return process.env.HOME ?? os.homedir();
-}
 
 /** Returns the macOS marker warning when LaunchAgent writes are locally disabled. */
 function collectMacLaunchAgentOverrideWarning(deps?: {
@@ -27,7 +23,7 @@ function collectMacLaunchAgentOverrideWarning(deps?: {
   if ((deps?.platform ?? process.platform) !== "darwin") {
     return null;
   }
-  const home = deps?.homeDir ?? resolveHomeDir();
+  const home = deps?.homeDir ?? resolveRequiredOsHomeDir();
   const markerCandidates = [path.join(home, ".openclaw", "disable-launchagent")];
   const exists = deps?.exists ?? fs.existsSync;
   const markerPath = markerCandidates.find((candidate) => exists(candidate));

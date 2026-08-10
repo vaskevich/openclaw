@@ -16,6 +16,7 @@ import { resolveCanonicalConfigPath } from "../config/paths.js";
 import type { ConfigFileSnapshot } from "../config/types.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
 import { isTruthyEnvValue } from "../infra/env.js";
+import { resolveEffectiveHomeDir } from "../infra/home-dir.js";
 import type {
   MigrationCheckpointIdentity,
   StartupMigrationLease,
@@ -26,7 +27,6 @@ import { ExitError } from "../runtime.js";
 import { createLazyRuntimeModule } from "../shared/lazy-runtime.js";
 import { resolveOpenClawStateSqlitePath } from "../state/openclaw-state-db.paths.js";
 import { assertOpenClawStateWriteAllowed } from "../state/openclaw-state-ownership.js";
-import { resolveHomeDir } from "../utils.js";
 import { noteIncludeConfinementWarning } from "./doctor-config-analysis.js";
 import {
   migrationCheckpointIdentitiesMatch,
@@ -75,7 +75,7 @@ function withLegacyCronWebhook(
 
 async function maybeMigrateLegacyConfig(): Promise<string[]> {
   const changes: string[] = [];
-  const home = resolveHomeDir();
+  const home = resolveEffectiveHomeDir();
   if (!home) {
     return changes;
   }

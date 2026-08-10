@@ -83,13 +83,8 @@ export function resolveConfigDir(
   return newDir;
 }
 
-/** Resolves the effective OpenClaw home directory, if one can be determined. */
-export function resolveHomeDir(): string | undefined {
-  return resolveEffectiveHomeDir(process.env, os.homedir);
-}
-
 function resolveHomeDisplayPrefix(): { home: string; prefix: string } | undefined {
-  const home = resolveHomeDir();
+  const home = resolveEffectiveHomeDir(process.env, os.homedir);
   if (!home) {
     return undefined;
   }

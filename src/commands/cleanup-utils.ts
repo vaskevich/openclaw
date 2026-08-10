@@ -12,9 +12,10 @@ import {
   prepareWorkspaceStateDeletion,
 } from "../agents/workspace-state-store.js";
 import type { OpenClawConfig } from "../config/types.openclaw.js";
+import { resolveEffectiveHomeDir } from "../infra/home-dir.js";
 import { isPathInside } from "../infra/path-guards.js";
 import type { RuntimeEnv } from "../runtime.js";
-import { resolveHomeDir, shortenHomeInString } from "../utils.js";
+import { shortenHomeInString } from "../utils.js";
 
 type RemovalResult = {
   ok: boolean;
@@ -83,7 +84,7 @@ function isUnsafeRemovalTarget(target: string): boolean {
   if (resolved === root) {
     return true;
   }
-  const home = resolveHomeDir();
+  const home = resolveEffectiveHomeDir();
   if (home && resolved === path.resolve(home)) {
     return true;
   }

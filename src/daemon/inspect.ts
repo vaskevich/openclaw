@@ -2,6 +2,7 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { normalizeLowercaseStringOrEmpty } from "@openclaw/normalization-core/string-coerce";
+import { resolveRequiredOsHomeDir } from "../infra/home-dir.js";
 import {
   GATEWAY_SERVICE_KIND,
   GATEWAY_SERVICE_MARKER,
@@ -12,7 +13,6 @@ import {
 import { resolveLaunchAgentLabel } from "./launchd-label.js";
 import { parseLaunchdPlistLabel } from "./launchd-plist.js";
 import { readLaunchDaemonPlistLabel } from "./launchd-system.js";
-import { resolveHomeDir } from "./paths.js";
 import { execSchtasks } from "./schtasks-exec.js";
 import { parseSystemdExecStart } from "./systemd-unit.js";
 
@@ -495,7 +495,7 @@ export async function findExtraGatewayServices(
 
   if (process.platform === "darwin") {
     try {
-      const home = resolveHomeDir(env);
+      const home = resolveRequiredOsHomeDir(env);
       const userDir = path.join(home, "Library", "LaunchAgents");
       for (const svc of await scanLaunchdDir({
         dir: userDir,
@@ -527,7 +527,7 @@ export async function findExtraGatewayServices(
 
   if (process.platform === "linux") {
     try {
-      const home = resolveHomeDir(env);
+      const home = resolveRequiredOsHomeDir(env);
       const userDir = path.join(home, ".config", "systemd", "user");
       for (const svc of await scanSystemdDir({
         dir: userDir,

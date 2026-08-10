@@ -22,7 +22,7 @@ import {
   sanitizeOpenClawGlobalStateSnapshot,
   sanitizeOpenClawStateLeaseRows,
 } from "../state/openclaw-state-snapshot-sanitizer.js";
-import { resolveHomeDir, resolveUserPath } from "../utils.js";
+import { resolveUserPath } from "../utils.js";
 import { resolveRuntimeServiceVersion } from "../version.js";
 import {
   cleanupBackupArchivePublication,
@@ -39,6 +39,7 @@ import {
 } from "./backup-volatile-stat-cache.js";
 import { formatErrorMessage } from "./errors.js";
 import { sameFileIdentity } from "./fs-safe-advanced.js";
+import { resolveEffectiveHomeDir } from "./home-dir.js";
 import { writeJson } from "./json-files.js";
 import { createVerifiedSqliteSnapshot } from "./sqlite-snapshot.js";
 import {
@@ -138,7 +139,9 @@ async function resolveOutputPath(params: {
     const cwdInsideSource = params.includedAssets.some((asset) =>
       isPathWithin(canonicalCwd, asset.sourcePath),
     );
-    const defaultDir = cwdInsideSource ? (resolveHomeDir() ?? path.dirname(params.stateDir)) : cwd;
+    const defaultDir = cwdInsideSource
+      ? (resolveEffectiveHomeDir() ?? path.dirname(params.stateDir))
+      : cwd;
     return path.resolve(defaultDir, basename);
   }
 
