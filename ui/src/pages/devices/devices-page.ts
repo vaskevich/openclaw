@@ -447,13 +447,15 @@ class DevicesPage extends OpenClawLightDomElement {
         })
       : showSecretRevealDialog({
           title: t("devices.inventory.rotateWithheldTitle"),
-          // Outcome, then what happens without the operator, then the one case that
-          // needs them. The protocol reason is the muted last line, not the lead.
+          status: "success",
+          // Outcome, then what happens without the operator. The one conditional branch
+          // is a callout so it cannot be skimmed past, and the protocol reason is a
+          // footnote rather than a fourth sentence competing with the reassurance.
           message: [
             t("devices.inventory.rotateWithheldOutcome", { device: device.name, role }),
             t("devices.inventory.rotateWithheldNext"),
-            t("devices.inventory.rotateWithheldException"),
           ],
+          callout: t("devices.inventory.rotateWithheldException"),
           acknowledgeLabel: t("common.close"),
           note: t("devices.inventory.rotateWithheldNote"),
         }));

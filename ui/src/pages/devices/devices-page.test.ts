@@ -82,14 +82,18 @@ function secretDialogText(): string {
   return document.body.querySelector(".secret-reveal__code")?.textContent?.trim() ?? "";
 }
 
-function clickDialogButton(label: string) {
+function findDialogButton(label: string): HTMLButtonElement {
   const button = [...document.body.querySelectorAll("button")].find(
     (candidate) => candidate.textContent?.trim() === label,
   );
   if (!(button instanceof HTMLButtonElement)) {
     throw new Error(`Expected ${label} button`);
   }
-  button.click();
+  return button;
+}
+
+function clickDialogButton(label: string) {
+  findDialogButton(label).click();
 }
 
 function createConnectedPage(client: GatewayBrowserClient) {
@@ -486,7 +490,14 @@ describe("DevicesPage gateway lifecycle", () => {
       t("devices.inventory.rotateWithheldOutcome", { device: "Mac Studio", role: "operator" }),
     );
     expect(document.body.textContent).toContain(t("devices.inventory.rotateWithheldNext"));
-    expect(document.body.textContent).toContain(t("devices.inventory.rotateWithheldException"));
+    // The one actionable branch is a callout, not a fourth sentence in the calm block.
+    expect(document.body.querySelector(".secret-reveal__callout")?.textContent).toContain(
+      t("devices.inventory.rotateWithheldException"),
+    );
+    expect(document.body.querySelector(".secret-reveal__status")).not.toBeNull();
+    // Closing a report of work already done commits nothing, so it is not the accent button.
+    const close = findDialogButton(t("common.close"));
+    expect(close.className).toBe("btn");
     expect(document.body.querySelector(".secret-reveal__note")?.textContent).toContain(
       t("devices.inventory.rotateWithheldNote"),
     );

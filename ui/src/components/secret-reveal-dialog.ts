@@ -4,6 +4,7 @@
 import { html, nothing, render } from "lit";
 import { t } from "../i18n/index.ts";
 import { renderCopyButton } from "./copy-button.ts";
+import { icons } from "./icons.ts";
 import "./modal-dialog.ts";
 
 type SecretRevealDialogOptions = {
@@ -17,6 +18,12 @@ type SecretRevealDialogOptions = {
   acknowledgeLabel: string;
   /** Only reachable with a secret, because only then is dismissal refused. */
   dismissHint?: string;
+  /** Success mark beside the title. Set only where the dialog reports a settled outcome;
+   *  a reveal that still needs the operator to act should not look finished. */
+  status?: "success";
+  /** The one conditional branch, lifted out of the calm text so it cannot be skimmed
+   *  past. Info tone: this is guidance the reader may not need, not an error. */
+  callout?: string;
   /** Muted trailing rationale. Never the answer to "what do I do now?"; that leads. */
   note?: string;
 };
@@ -52,6 +59,10 @@ export function showSecretRevealDialog(options: SecretRevealDialogOptions): Prom
       paint();
     };
     const paragraphs = Array.isArray(options.message) ? options.message : [options.message];
+    // Sibling convention (confirm-dialog): the accent button is the action that commits
+    // something. Acknowledging a secret is that gate; closing a report of work already
+    // done is not, so it stays the neutral button.
+    const acknowledgeClass = options.secret ? "btn primary" : "btn";
     const paint = () => {
       render(
         html`
@@ -61,16 +72,20 @@ export function showSecretRevealDialog(options: SecretRevealDialogOptions): Prom
             @modal-cancel=${handleCancel}
           >
             <div class="exec-approval-card">
-              <div class="exec-approval-header">
-                <div>
-                  <div class="exec-approval-title">${options.title}</div>
-                  <div class="secret-reveal__body">
-                    ${paragraphs.map(
-                      (paragraph) => html`<div class="exec-approval-sub">${paragraph}</div>`,
-                    )}
-                  </div>
-                </div>
+              <div class="secret-reveal__header">
+                ${options.status === "success"
+                  ? html`<span class="secret-reveal__status" aria-hidden="true"
+                      >${icons.check}</span
+                    >`
+                  : nothing}
+                <div class="exec-approval-title">${options.title}</div>
               </div>
+              <div class="secret-reveal__body">
+                ${paragraphs.map((paragraph) => html`<p>${paragraph}</p>`)}
+              </div>
+              ${options.callout
+                ? html`<div class="callout info secret-reveal__callout">${options.callout}</div>`
+                : nothing}
               ${options.secret
                 ? html`
                     <div class="secret-reveal__value">
@@ -84,7 +99,7 @@ export function showSecretRevealDialog(options: SecretRevealDialogOptions): Prom
                 : nothing}
               ${options.note ? html`<p class="secret-reveal__note">${options.note}</p>` : nothing}
               <div class="exec-approval-actions">
-                <button type="button" class="btn primary" autofocus @click=${acknowledge}>
+                <button type="button" class=${acknowledgeClass} autofocus @click=${acknowledge}>
                   ${options.acknowledgeLabel}
                 </button>
               </div>
