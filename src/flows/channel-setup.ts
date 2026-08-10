@@ -250,6 +250,8 @@ export async function setupChannels(
     getVisibleChannelEntries().some((entry) => entry.id === requestedTargetedChannel)
       ? requestedTargetedChannel
       : undefined;
+  const pickerInitialSelection =
+    requestedTargetedChannel && !targetedChannel ? undefined : options?.initialSelection?.[0];
   const shouldConfigure =
     options?.skipConfirm || targetedChannel
       ? true
@@ -271,7 +273,7 @@ export async function setupChannels(
   }
 
   const quickstartDefault =
-    options?.initialSelection?.[0] ??
+    pickerInitialSelection ??
     (deferStatusUntilSelection ? undefined : resolveQuickstartDefault(statusByChannel));
 
   const shouldPromptAccountIds = options?.promptAccountIds === true;
@@ -913,7 +915,7 @@ export async function setupChannels(
 
   if (!targetedChannel && options?.quickstartDefaults) {
     const skipValue = "__skip__" as const;
-    const quickstartInitialValue = options?.initialSelection?.[0] ?? skipValue;
+    const quickstartInitialValue = pickerInitialSelection ?? skipValue;
     while (true) {
       const { entries, catalogById } = getChannelEntries();
       const choice = await prompter.select({
@@ -944,7 +946,7 @@ export async function setupChannels(
     }
   } else if (!targetedChannel || targetedSetupReturnedToPicker) {
     const doneValue = "__done__" as const;
-    const initialValue = options?.initialSelection?.[0] ?? quickstartDefault;
+    const initialValue = pickerInitialSelection ?? quickstartDefault;
     while (true) {
       const { entries, catalogById } = getChannelEntries();
       const choice = await prompter.select({

@@ -923,6 +923,7 @@ describe("setupChannels workspace shadow exclusion", () => {
     expect(noteChannelPrimer).toHaveBeenCalledTimes(1);
     expect(select).toHaveBeenCalledWith(
       expect.objectContaining({
+        initialValue: undefined,
         message: "Select a channel",
       }),
     );
