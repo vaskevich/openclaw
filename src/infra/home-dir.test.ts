@@ -199,6 +199,15 @@ describe("resolveOsHomeDir", () => {
       ),
     ).toBe(path.resolve("/home/alice"));
   });
+
+  it.each([
+    ["drive root", "C:\\Users\\alice"],
+    ["UNC root", "\\\\server\\share\\alice"],
+  ])("preserves a Windows %s while rendering on another host", (_name, userProfile) => {
+    expect(
+      resolveOsHomeDir({ USERPROFILE: userProfile } as NodeJS.ProcessEnv, () => "/fallback"),
+    ).toBe(userProfile);
+  });
 });
 
 describe("expandHomePrefix", () => {

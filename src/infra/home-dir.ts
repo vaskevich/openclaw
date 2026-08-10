@@ -19,6 +19,12 @@ function normalizeSafe(homedir: () => string): string | undefined {
   }
 }
 
+function resolveOsHomePath(raw: string): string {
+  // Cross-platform service rendering passes Windows homes through POSIX hosts.
+  // Preserve drive and UNC roots instead of prefixing them with the current cwd.
+  return path.win32.isAbsolute(raw) ? raw : path.resolve(raw);
+}
+
 function resolveTermuxHome(env: NodeJS.ProcessEnv): string | undefined {
   const prefix = normalize(env.PREFIX);
   if (!prefix || !normalize(env.ANDROID_DATA)) {
@@ -68,7 +74,7 @@ export function resolveOsHomeDir(
   homedir: () => string = os.homedir,
 ): string | undefined {
   const raw = resolveRawOsHomeDir(env, homedir);
-  return raw ? path.resolve(raw) : undefined;
+  return raw ? resolveOsHomePath(raw) : undefined;
 }
 
 /** Resolves the effective home or falls back to cwd when no home source exists. */
@@ -92,7 +98,7 @@ export function resolveRequiredOsHomeDir(
 ): string {
   const resolved = resolveOsHomeDir(env, homedir) ?? tryProcessCwd();
   if (resolved) {
-    return path.resolve(resolved);
+    return resolveOsHomePath(resolved);
   }
   throw new Error(
     "Unable to resolve an OS home: set HOME or USERPROFILE, or run from an existing directory.",
